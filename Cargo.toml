@@ -1,0 +1,17 @@
+[package]
+name = "respeaker_algo"
+version = "0.1.0"
+edition = "2024"
+description = "ReSpeaker Mic Array v2.0 (XVF3000) 录音与语音算法工具"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+cpal = "0.15"
+ctrlc = "3.4"
+
+[dev-dependencies]
+hound = "3.5"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.17"
