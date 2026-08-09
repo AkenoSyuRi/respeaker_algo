@@ -1,10 +1,15 @@
-//! ReSpeaker Mic Array v2.0（XVF3000）录音工具。
+//! ReSpeaker Mic Array v2.0（XVF3000）录音 + 实时 DOA 工具。
 //!
 //! 默认（无子命令）直接启动录制；`--duration` 指定时长（0 = 直到 Ctrl+C），
 //! 输出到 `{out_dir}/{prefix}_respeaker_{algo,mic,ref}.wav`（6 通道固件拆分
 //! 为 3 个文件：ch0 算法输出 / ch1-4 麦克风原始 / ch5 回放）。
 //!
 //! 子命令 `list-devices` 列出音频输入设备。
+//!
+//! 实时 DOA（`--doa`）：基于 ch1..ch4 的 4 路原始麦克风做单声源二维方位角
+//! 估计（512 点 Hann 窗 / 256 点帧移 / 360° 1° 网格 / PHAT-β SRP + 圆周
+//! Kalman），每 16 ms 一个内部观测，终端限速 10 Hz；`--doa-csv` 额外保存
+//! 逐帧 CSV。DOA 默认关闭，不影响现有录音输出。
 //!
 //! 采集后端（`--backend`）：
 //! - `auto`（默认）：Windows 上走 WASAPI 独占模式（可拿到 6ch/16k），
@@ -13,13 +18,15 @@
 //! - `wasapi`：WASAPI 独占模式，仅 Windows。
 
 mod audio;
+mod doa;
 mod recorder;
-mod wav;
 #[cfg(windows)]
 mod wasapi;
+mod wav;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use doa::{DoaConfig, DoaRunOptions};
 use recorder::{BackendChoice, RecordOptions};
 
 #[derive(Parser)]
@@ -60,6 +67,30 @@ struct Cli {
     /// 输出文件前缀（默认当前时间戳，如 20260715_143012）
     #[arg(long)]
     prefix: Option<String>,
+
+    /// 启用实时 4-Mic DOA（仅支持 16kHz/6ch ReSpeaker 输入）
+    #[arg(long)]
+    doa: bool,
+
+    /// 保存逐帧 DOA CSV；该选项同时隐式启用 DOA
+    #[arg(long)]
+    doa_csv: bool,
+
+    /// PHAT 部分白化指数，范围 0..=1
+    #[arg(long, default_value_t = 0.75)]
+    doa_beta: f32,
+
+    /// CPSD/PSD EMA 时间常数，单位 ms
+    #[arg(long, default_value_t = 100.0)]
+    doa_cpsd_tau_ms: f32,
+
+    /// 输出角度旋转补偿，单位度
+    #[arg(long, default_value_t = 0.0)]
+    doa_offset_deg: f32,
+
+    /// 输出角度改为顺时针增加
+    #[arg(long)]
+    doa_clockwise: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -98,6 +129,17 @@ fn main() {
             },
             out_dir: cli.out_dir,
             prefix: cli.prefix,
+            doa: DoaRunOptions {
+                enabled: cli.doa || cli.doa_csv,
+                csv: cli.doa_csv,
+                config: DoaConfig {
+                    beta: cli.doa_beta,
+                    cpsd_tau_ms: cli.doa_cpsd_tau_ms,
+                    angle_offset_deg: cli.doa_offset_deg,
+                    clockwise: cli.doa_clockwise,
+                    ..DoaConfig::default()
+                },
+            },
         }),
     };
 

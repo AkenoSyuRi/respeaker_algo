@@ -9,6 +9,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 cpal = "0.15"
 ctrlc = "3.4"
+realfft = "3.5"
 
 [dev-dependencies]
 hound = "3.5"

@@ -12,9 +12,9 @@
 //! 注意：独占模式下设备不能被其它程序占用（否则 `AUDCLNT_E_DEVICE_IN_USE`），
 //! 且系统对该设备的音效处理（如增强）不生效。
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::Arc;
 use std::thread;
 
 use wasapi::{
@@ -188,7 +188,11 @@ fn run_capture(
     let (default_period, min_period) = audio_client
         .get_device_period()
         .map_err(|e| format!("获取设备周期失败: {e}"))?;
-    let period_hns = if min_period > 0 { min_period } else { default_period };
+    let period_hns = if min_period > 0 {
+        min_period
+    } else {
+        default_period
+    };
     let buffer_hns: i64 = 1_000_000; // 100ms
 
     audio_client
@@ -218,9 +222,7 @@ fn run_capture(
     audio_client
         .start_stream()
         .map_err(|e| format!("启动音频流失败: {e}"))?;
-    println!(
-        "WASAPI 独占采集已启动: {name}（{rate}Hz/{channels}ch，buffer={buffer_frames} 帧）"
-    );
+    println!("WASAPI 独占采集已启动: {name}（{rate}Hz/{channels}ch，buffer={buffer_frames} 帧）");
 
     let frame_bytes = channels as usize * 2;
     // 独占模式下 GetNextPacketSize 不可用（wasapi-rs 直接返回 None），

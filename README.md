@@ -1,8 +1,9 @@
 # respeaker_algo
 
-ReSpeaker Mic Array v2.0（XMOS XVF-3000）录音与语音算法工具。
+ReSpeaker Mic Array v2.0（XMOS XVF-3000）录音 + 实时 DOA 工具。
 
-当前阶段：**多通道录音 CLI**。后续规划：16ms 帧实时 DOA、波束成形（BF）等。
+当前阶段：**多通道录音 CLI + 实时 4-Mic 单声源二维 DOA**（`--doa` 可选启用，默认关闭）。
+后续规划：波束成形（BF）、MIC-REF 相干抑制等。
 
 ## 固件与通道布局
 
@@ -46,6 +47,21 @@ respeaker_algo list-devices --verbose
 
 # 强制指定采集后端（auto / cpal / wasapi）
 respeaker_algo --backend wasapi
+
+# 实时 DOA（终端每 100ms 显示一次方位角）
+respeaker_algo --doa
+
+# DOA + 逐帧 CSV
+respeaker_algo --doa --doa-csv
+
+# DOA 角度方向标定示例
+respeaker_algo \
+  --doa \
+  --doa-csv \
+  --doa-beta 0.75 \
+  --doa-cpsd-tau-ms 100 \
+  --doa-offset-deg 90 \
+  --doa-clockwise
 ```
 
 ### 输出文件
@@ -63,6 +79,64 @@ respeaker_algo --backend wasapi
 > 通道元信息：输出为标准 16-bit PCM `WAVEFORMATEX`（不含 `WAVEFORMATEXTENSIBLE`
 > 的 `dwChannelMask` 通道布局），播放器/分析软件会将 `*_respeaker_mic.wav`
 > 的 4 个通道显示为 **1、2、3、4**，而不是 L/R/C/LFE。
+
+## 实时 DOA
+
+启用 `--doa` 后，基于拆分后的 `ch1..ch4`（4 路原始麦克风，**不使用** ch0 固件 DOA）
+做单声源二维水平面方位角估计，每 16ms 一个内部观测，终端限速 10 Hz。
+DOA **不修改**三个 WAV 文件的内容与命名。
+
+### 固定时频配置
+
+```text
+16 kHz
+512 点 Hann 窗（32 ms）
+256 点 hop（16 ms）
+360 个 1° 候选方向
+```
+
+### 算法链
+
+```text
+CPSD EMA → coherence-weighted PHAT-β SRP → confidence gate → circular Kalman
+```
+
+- 4 路 RFFT + 4 个 PSD / 6 个 CPSD 指数滑动平均（时间常数由 `--doa-cpsd-tau-ms` 折算 alpha）；
+- 相邻 pair 频带上限 3500 Hz、对径 pair 上限 2500 Hz（理论混叠边界内），低频 250→400 Hz 淡入；
+- 置信度由能量、MSC、主/次峰间隔、robust prominence 合成；
+- 圆周恒角速度 Kalman：3 帧方向一致获取、`confidence≥0.40` 且 innovation ≤60° 更新、
+  3 帧一致大跳变重置、超过 500ms 无更新回到 Searching。
+
+### CSV 字段
+
+`--doa-csv` 输出 `{out_dir}/{prefix}_respeaker_doa.csv`，首行：
+
+```csv
+time_ms,raw_deg,tracked_deg,confidence,status,observation_used,peak_score,second_peak_score,peak_gap_ratio,prominence,mean_msc,rms_dbfs
+```
+
+每个 16ms 内部观测一行（不做 10 Hz 限速）；`raw_deg`/`tracked_deg` 为空表示无观测/未锁定；
+`status` 为 `searching`/`tracking`/`coasting`。
+
+### 角度定义与标定
+
+内部数学坐标：0° = +X、90° = +Y、逆时针增加。对外输出：
+
+```text
+output = wrap360(angle_offset_deg + (clockwise ? -internal : internal))
+```
+
+默认 `--doa-offset-deg 0`、非顺时针。设备外壳/丝印/LED 的实际 0° 方向需实测标定：
+建议现场把声源固定在已知方向，调整 `--doa-offset-deg` 与 `--doa-clockwise` 使
+raw 角度与真实方向一致。
+
+### 限制
+
+- 单声源、二维水平面、远场近似；不做多人定位/波束形成/AEC；
+- 仅支持 16kHz/6ch 原始输入（Windows 需 WASAPI 独占后端才有完整 6 通道）；
+- 32 ms 分析窗带来首帧等待，CPSD warmup（2 帧）与获取门控（3 帧）还会增加首次锁定时间；
+- 默认阈值（acquire 0.65 / update 0.40）按真实环境调参，勿凭本地录音随意改动；
+  合成信号测试使用放宽的测试阈值。
 
 ## 采集后端
 
@@ -89,14 +163,23 @@ respeaker_algo --backend wasapi
 
 ```
 src/
-  main.rs      CLI 入口（默认录制模式 / list-devices）
+  main.rs      CLI 入口（默认录制模式 / list-devices，DOA 参数）
   audio.rs     cpal 后端：设备枚举、设备选择、流配置查找（非 Windows 主路径）
   wasapi.rs    Windows WASAPI 独占后端（设备枚举、6ch/16k 采集循环）
-  recorder.rs  后端分流、采集 → 拆分 → 3 文件 WAV 写入
+  recorder.rs  后端分流、采集 → 拆分 → 3 文件 WAV 写入 + DOA 串行处理
+  wav.rs       标准 WAVEFORMATEX 流式写入（无通道布局元信息）
+  doa/
+    mod.rs      DoaConfig/DoaResult/DoaProcessor 编排
+    framer.rs   任意块长 → 512/256 分帧
+    geometry.rs 阵列坐标、pair、频带权重、steering LUT
+    srp.rs      FFT、PSD/CPSD EMA、PHAT-β SRP、置信度
+    tracker.rs  置信度门控状态机 + 圆周 Kalman
+    output.rs   DoaRuntime：10 Hz 终端 + 逐帧 CSV
 ```
 
-- 16ms 帧 = 256 采样 @16kHz，后续 DOA/BF 按此对齐消费 ch1–ch4；
-- `recorder::split_6ch` 提供 6 通道交织 → algo/mic/ref 拆分，算法模块可复用。
+- DOA 与录音在同一消费线程串行执行（不新增线程、不修改采集回调）；
+- 16ms 帧 = 256 采样 @16kHz，DOA 与 WAV 拆分共用 `recorder::split_6ch_into` 的
+  `ch1..ch4` 数据。
 
 ## 测试
 

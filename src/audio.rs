@@ -68,7 +68,11 @@ fn device_by_name(keyword: &str) -> Result<Device, String> {
     let lower = keyword.to_lowercase();
     host.input_devices()
         .map_err(|e| format!("枚举输入设备失败: {e}"))?
-        .find(|d| d.name().map(|n| n.to_lowercase().contains(&lower)).unwrap_or(false))
+        .find(|d| {
+            d.name()
+                .map(|n| n.to_lowercase().contains(&lower))
+                .unwrap_or(false)
+        })
         .ok_or_else(|| format!("没有名称包含 {:?} 的输入设备", keyword))
 }
 
@@ -92,8 +96,7 @@ pub fn pick_input_device(spec: Option<&str>) -> Result<Device, String> {
                 return Ok(d);
             }
             host.default_input_device().ok_or_else(|| {
-                "未找到输入设备。请插入 ReSpeaker Mic Array 并用 list-devices 查看，"
-                    .to_string()
+                "未找到输入设备。请插入 ReSpeaker Mic Array 并用 list-devices 查看，".to_string()
             })
         }
     }

@@ -104,7 +104,10 @@ mod tests {
 
     fn temp_wav(name: &str) -> String {
         std::env::temp_dir()
-            .join(format!("respeaker_wavsink_test_{}_{name}", std::process::id()))
+            .join(format!(
+                "respeaker_wavsink_test_{}_{name}",
+                std::process::id()
+            ))
             .to_string_lossy()
             .into_owned()
     }
@@ -129,7 +132,10 @@ mod tests {
         assert_eq!(spec.bits_per_sample, 16);
         assert_eq!(spec.sample_format, hound::SampleFormat::Int);
         let got: Vec<i16> = r.samples::<i16>().map(|s| s.unwrap()).collect();
-        assert_eq!(got, vec![0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33]);
+        assert_eq!(
+            got,
+            vec![0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33]
+        );
         std::fs::remove_file(&path).ok();
     }
 
