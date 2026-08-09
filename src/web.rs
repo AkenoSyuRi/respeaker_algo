@@ -356,6 +356,10 @@ mod tests {
         assert!(INDEX_HTML.contains(r#"data-angle="90" x="342" y="184""#));
         assert!(INDEX_HTML.contains("180 + radius * Math.sin(rad)"));
         assert!(INDEX_HTML.contains("180 + radius * Math.cos(rad)"));
+        assert!(INDEX_HTML.contains(r#"data-mic="1" transform="translate(144 216)""#));
+        assert!(INDEX_HTML.contains(r#"data-mic="2" transform="translate(216 216)""#));
+        assert!(INDEX_HTML.contains(r#"data-mic="3" transform="translate(216 144)""#));
+        assert!(INDEX_HTML.contains(r#"data-mic="4" transform="translate(144 144)""#));
     }
 
     fn start_test_server(max_clients: usize) -> (WebServerHandle, WebBroadcaster) {
