@@ -1,15 +1,17 @@
 //! 阵列几何、pair 与 steering LUT。
 //!
-//! ReSpeaker Mic Array v2.0 的 4 个 mic 位于半径 32mm 的圆上（ch1..ch4，
-//! 顺序对应拆分后 `*_respeaker_mic.wav` 的 1..4 通道），平面坐标单位为米：
+//! ReSpeaker Mic Array v2.0 的 4 个 mic 组成边长 45.7 mm 的正方形（ch1..ch4，
+//! 顺序对应拆分后 `*_respeaker_mic.wav` 的 1..4 通道），阵列中心为原点，
+//! 平面坐标单位为米：
 //!
 //! ```text
-//!       mic0 (-0.032, 0)     mic1 (0, -0.032)
-//!       mic2 (+0.032, 0)     mic3 (0, +0.032)
+//!       mic3/ch3 (-0.02285, +0.02285)   mic2/ch2 (+0.02285, +0.02285)
+//!       mic4/ch4 (-0.02285, -0.02285)   mic1/ch1 (+0.02285, -0.02285)
 //! ```
 //!
-//! 相邻基线 = √2·0.032 ≈ 0.0452548 m；相对基线 = 0.064 m。理论空间混叠
-//! 频率约为 adjacent 3790 Hz / opposite 2680 Hz，因此频带保守限制为
+//! `+X` 为 0°，`+Y` 为 90°，角度逆时针增加。相邻基线 = 0.0457 m；
+//! 相对基线 = √2·0.0457 ≈ 0.06463 m。理论空间混叠频率约为
+//! adjacent 3753 Hz / opposite 2654 Hz，因此频带保守限制为
 //! adjacent 3500 Hz / opposite 2500 Hz。
 
 use realfft::num_complex::Complex32;
@@ -19,12 +21,18 @@ use crate::doa::{ANGLE_COUNT, FFT_BINS, FRAME_SIZE, MIC_COUNT, SAMPLE_RATE};
 /// 声速（m/s）。
 pub const SPEED_OF_SOUND: f32 = 343.0;
 
-/// 4 个 mic 平面坐标（米）。
+/// 相邻麦克风中心距（米）。
+pub const ADJACENT_MIC_DISTANCE_M: f32 = 0.0457;
+
+/// 正方形顶点相对坐标轴的距离，即相邻麦克风中心距的一半（米）。
+const MIC_AXIS_COORD_M: f32 = ADJACENT_MIC_DISTANCE_M / 2.0;
+
+/// 4 个物理麦克风的平面坐标（米）；数组索引 0..3 对应 mic1..mic4 / ch1..ch4。
 pub const RESPEAKER_V2_MICS_M: [[f32; 2]; MIC_COUNT] = [
-    [-0.032, 0.000],
-    [0.000, -0.032],
-    [0.032, 0.000],
-    [0.000, 0.032],
+    [MIC_AXIS_COORD_M, -MIC_AXIS_COORD_M],
+    [MIC_AXIS_COORD_M, MIC_AXIS_COORD_M],
+    [-MIC_AXIS_COORD_M, MIC_AXIS_COORD_M],
+    [-MIC_AXIS_COORD_M, -MIC_AXIS_COORD_M],
 ];
 
 /// 6 个互谱 pair：(0,1) 相邻、(0,2) 相对、(0,3) 相邻、(1,2) 相邻、(1,3) 相对、(2,3) 相邻。
@@ -153,11 +161,11 @@ mod tests {
 
     #[test]
     fn geometry_coordinates_and_pairs() {
-        // 4 个坐标
-        assert_eq!(RESPEAKER_V2_MICS_M[0], [-0.032, 0.0]);
-        assert_eq!(RESPEAKER_V2_MICS_M[1], [0.0, -0.032]);
-        assert_eq!(RESPEAKER_V2_MICS_M[2], [0.032, 0.0]);
-        assert_eq!(RESPEAKER_V2_MICS_M[3], [0.0, 0.032]);
+        // mic1 在第四象限、mic2 在第一象限、mic3 在第二象限、mic4 在第三象限。
+        assert_eq!(RESPEAKER_V2_MICS_M[0], [0.02285, -0.02285]);
+        assert_eq!(RESPEAKER_V2_MICS_M[1], [0.02285, 0.02285]);
+        assert_eq!(RESPEAKER_V2_MICS_M[2], [-0.02285, 0.02285]);
+        assert_eq!(RESPEAKER_V2_MICS_M[3], [-0.02285, -0.02285]);
 
         // 6 对：i < j，无重复，覆盖全部组合
         let mut seen = std::collections::HashSet::new();
@@ -177,16 +185,16 @@ mod tests {
 
     #[test]
     fn pair_lengths() {
-        // 精确验证 4 个相邻对 ≈ 0.0452548，2 个相对对 = 0.064
-        let adjacent: f32 = std::f32::consts::SQRT_2 * 0.032;
+        // 精确验证 4 个相邻对 = 0.0457，2 个相对对 = √2·0.0457。
+        let opposite = std::f32::consts::SQRT_2 * ADJACENT_MIC_DISTANCE_M;
         for (idx, &(i, j)) in MIC_PAIRS.iter().enumerate() {
             let ri = RESPEAKER_V2_MICS_M[i];
             let rj = RESPEAKER_V2_MICS_M[j];
             let d = ((ri[0] - rj[0]).powi(2) + (ri[1] - rj[1]).powi(2)).sqrt();
             let expected = if pair_is_opposite(idx) {
-                0.064
+                opposite
             } else {
-                adjacent
+                ADJACENT_MIC_DISTANCE_M
             };
             assert!(
                 (d - expected).abs() < 1e-6,

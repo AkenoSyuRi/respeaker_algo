@@ -122,6 +122,15 @@ time_ms,raw_deg,tracked_deg,confidence,status,observation_used,peak_score,second
 
 内部数学坐标：0° = +X、90° = +Y、逆时针增加。对外输出：
 
+阵列中心为原点，相邻麦克风中心距为 45.7 mm；`ch1..ch4` 对应的坐标为：
+
+```text
+mic1/ch1 = (+22.85, -22.85) mm   第四象限
+mic2/ch2 = (+22.85, +22.85) mm   第一象限
+mic3/ch3 = (-22.85, +22.85) mm   第二象限
+mic4/ch4 = (-22.85, -22.85) mm   第三象限
+```
+
 ```text
 output = wrap360(angle_offset_deg + (clockwise ? -internal : internal))
 ```
