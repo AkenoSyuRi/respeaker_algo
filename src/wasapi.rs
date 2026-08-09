@@ -1,10 +1,9 @@
 //! Windows WASAPI 独占模式采集后端（仅 Windows 编译）。
 //!
-//! 背景：Windows 声卡共享模式混音器会把 UAC 设备降级为 48kHz/2ch（cpal
-//! WASAPI 后端即共享模式），拿不到 `6_channels_firmware.bin` 声明的
-//! 16kHz/6ch。独占模式用 `WAVEFORMATEXTENSIBLE`（16-bit PCM / 6ch / 16kHz）
-//! 直接初始化 `IAudioClient`，可拿到完整 6 通道原始数据（ch0 算法输出、
-//! ch1-4 mic 原始、ch5 回放），供后续 DOA / BF 使用。
+//! Windows 声卡共享模式混音器会把该 UAC 设备降级为 48kHz/2ch，拿不到
+//! `6_channels_firmware.bin` 声明的 16kHz/6ch。本程序只使用独占模式，以
+//! `WAVEFORMATEXTENSIBLE`（16-bit PCM / 6ch / 16kHz）直接初始化
+//! `IAudioClient`，获取 ch0 算法输出、ch1-4 原始 mic 和 ch5 回放参考。
 //!
 //! 基于 `wasapi` crate（wasapi-rs）封装，事件驱动独占模式：
 //! `StreamMode::EventsExclusive { period_hns }`。
@@ -23,7 +22,6 @@ use wasapi::{
 
 /// 单个 WASAPI 输入设备的信息。
 pub struct WasapiDeviceInfo {
-    pub index: usize,
     pub name: String,
     /// 设备 ID（跨线程/进程稳定，用于采集线程重新定位设备）。
     pub id: String,
@@ -39,8 +37,8 @@ fn init_com() -> Result<(), String> {
     }
 }
 
-/// 枚举所有活动的输入设备（WASAPI 视图，索引与 list-devices 的编号一致）。
-pub fn list_devices() -> Result<Vec<WasapiDeviceInfo>, String> {
+/// 枚举所有活动的 WASAPI 输入设备，用于自动查找 ReSpeaker。
+fn list_input_devices() -> Result<Vec<WasapiDeviceInfo>, String> {
     init_com()?;
     let collection = DeviceCollection::new(&Direction::Capture)
         .map_err(|e| format!("枚举 WASAPI 输入设备失败: {e}"))?;
@@ -56,48 +54,20 @@ pub fn list_devices() -> Result<Vec<WasapiDeviceInfo>, String> {
             .get_friendlyname()
             .map_err(|e| format!("获取设备 {index} 名称失败: {e}"))?;
         let id = dev.get_id().unwrap_or_else(|_| "<无ID>".to_string());
-        out.push(WasapiDeviceInfo {
-            index: index as usize,
-            name,
-            id,
-        });
+        out.push(WasapiDeviceInfo { name, id });
     }
     Ok(out)
 }
 
-/// 按 `spec` 选择设备：None → 自动识别 ReSpeaker；数字 → 索引；其它 → 名称包含匹配。
-pub fn pick_input_device(spec: Option<&str>) -> Result<WasapiDeviceInfo, String> {
-    let all = list_devices()?;
+/// 自动选择名称包含 `ReSpeaker` 的输入设备。
+pub fn pick_respeaker_input_device() -> Result<WasapiDeviceInfo, String> {
+    let all = list_input_devices()?;
     if all.is_empty() {
         return Err("未找到任何音频输入设备".into());
     }
-    let matched = match spec {
-        Some(s) if s.trim().parse::<usize>().is_ok() => {
-            let idx = s.trim().parse::<usize>().unwrap();
-            all.iter().find(|d| d.index == idx).map(|d| d.name.clone())
-        }
-        Some(s) => {
-            let lower = s.to_lowercase();
-            all.iter()
-                .find(|d| d.name.to_lowercase().contains(&lower))
-                .map(|d| d.name.clone())
-        }
-        None => all
-            .iter()
-            .find(|d| d.name.contains("ReSpeaker"))
-            .map(|d| d.name.clone()),
-    };
-    let Some(name) = matched else {
-        let hint = if spec.is_none() {
-            "；请用 list-devices 查看可用设备并用 --device 指定"
-        } else {
-            ""
-        };
-        return Err(format!("未找到匹配的输入设备: {:?}{}", spec, hint));
-    };
     all.into_iter()
-        .find(|d| d.name == name)
-        .ok_or_else(|| format!("设备 {name} 已消失"))
+        .find(|d| d.name.to_lowercase().contains("respeaker"))
+        .ok_or_else(|| "未找到名称包含 ReSpeaker 的输入设备；请确认设备已连接".into())
 }
 
 /// 采集会话句柄：Drop 时置停止标志并等待采集线程退出。

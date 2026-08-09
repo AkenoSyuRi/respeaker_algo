@@ -136,14 +136,6 @@ impl DoaConfig {
     }
 }
 
-/// CLI 层的 DOA 运行选项。
-#[derive(Clone, Debug)]
-pub struct DoaRunOptions {
-    pub enabled: bool,
-    pub csv: bool,
-    pub config: DoaConfig,
-}
-
 /// 单帧 DOA 结果。
 #[derive(Clone, Debug)]
 pub struct DoaResult {

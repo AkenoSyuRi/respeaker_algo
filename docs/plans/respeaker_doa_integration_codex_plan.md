@@ -1,5 +1,9 @@
 # ReSpeaker 4-Mic 实时 DOA 集成实施方案
 
+> 历史说明：本文记录最初的 DOA CLI 集成方案。当前 CLI 和运行时入口已由
+> `respeaker_pipeline_config_cli_refactor_plan.md` 取代；DOA 参数现在来自
+> `configs/doa.toml`。本文中的算法、几何和数值要求仍然有效，旧 CLI 示例不再有效。
+
 > 本文档用于让 Codex 直接在仓库中完成实现，不是仅供讨论的设计草案。
 
 ## 0. 执行要求

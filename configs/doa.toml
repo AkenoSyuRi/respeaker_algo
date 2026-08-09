@@ -1,0 +1,13 @@
+version = 1
+
+[[modules]]
+type = "doa"
+enabled = true
+csv = true
+beta = 0.75
+cpsd_tau_ms = 100.0
+angle_offset_deg = 0.0
+clockwise = false
+acquire_confidence = 0.65
+update_confidence = 0.40
+max_coast_ms = 500

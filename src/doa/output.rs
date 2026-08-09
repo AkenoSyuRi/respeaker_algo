@@ -41,7 +41,7 @@ impl DoaRuntime {
     }
 
     /// 输入一块 4 路交织 i16 数据；处理并输出（终端限速 100ms，CSV 每帧）。
-    pub fn push_block(&mut self, mics_interleaved: &[i16]) -> Result<(), String> {
+    pub fn push_block(&mut self, mics_interleaved: &[i16]) -> Result<Option<DoaResult>, String> {
         self.results.clear();
         self.processor
             .push_interleaved(mics_interleaved, &mut self.results)?;
@@ -56,7 +56,7 @@ impl DoaRuntime {
                 write_csv_line(csv, r).map_err(|e| format!("写入 DOA CSV 失败: {e}"))?;
             }
         }
-        Ok(())
+        Ok(self.results.last().cloned())
     }
 
     /// 刷新并关闭 CSV。
