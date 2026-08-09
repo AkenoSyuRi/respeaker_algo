@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ReSpeaker DOA Viewer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d1117; --panel: #161b22; --panel2: #1c232d;
+      --border: #30363d; --text: #f0f6fc; --muted: #8b949e;
+      --cyan: #39c5cf; --amber: #f0b45a; --green: #56d364; --red: #f85149;
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; color: var(--text); background: radial-gradient(circle at 50% 0, #152a32 0, var(--bg) 42%); }
+    main { width: min(1080px, calc(100% - 32px)); margin: auto; padding: 24px 0; }
+    header { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 16px; }
+    h1 { margin: 0; font-size: 25px; }
+    header p { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+    .status { padding: 6px 12px; border: 1px solid var(--border); border-radius: 999px; color: var(--red); background: var(--panel); font-size: 12px; font-weight: 700; }
+    .status.connected { color: var(--green); border-color: #2d6b3a; }
+    .grid { display: grid; grid-template-columns: minmax(300px, .9fr) minmax(380px, 1.25fr); gap: 16px; }
+    .panel { border: 1px solid var(--border); border-radius: 10px; background: rgba(22,27,34,.96); box-shadow: 0 18px 45px #0006; overflow: hidden; }
+    .summary { padding: 20px; }
+    .eyebrow { color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; }
+    .angle { margin: 8px 0 18px; font-size: clamp(58px, 8vw, 88px); font-weight: 750; line-height: 1; font-variant-numeric: tabular-nums; }
+    .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .metric { padding: 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel2); }
+    .metric span { display: block; color: var(--muted); font-size: 11px; }
+    .metric strong { display: block; margin-top: 5px; font-size: 18px; font-variant-numeric: tabular-nums; }
+    .confidence { margin-top: 18px; }
+    .confidence-label { display: flex; justify-content: space-between; margin-bottom: 7px; color: var(--muted); font-size: 12px; }
+    .bar { height: 11px; border-radius: 99px; background: #090c10; overflow: hidden; }
+    .bar div { width: 0; height: 100%; background: linear-gradient(90deg, var(--red), var(--amber), var(--green)); transition: width 120ms linear; }
+    .compass-head, .trace-head { padding: 13px 16px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 12px; font-weight: 700; }
+    .compass-wrap { display: grid; place-items: center; padding: 16px; }
+    svg { width: min(100%, 440px); height: auto; }
+    .axis { stroke: #8b949e; opacity: .3; }
+    .ring { fill: none; stroke: #8b949e; opacity: .32; }
+    .mic { fill: #202b36; stroke: #8395a5; stroke-width: 2; }
+    .mic-label { fill: var(--text); font-size: 12px; text-anchor: middle; dominant-baseline: middle; }
+    .raw { stroke: var(--amber); stroke-width: 4; opacity: .8; }
+    .tracked { stroke: var(--cyan); stroke-width: 8; stroke-linecap: round; }
+    .trace { grid-column: 1 / -1; }
+    .trace-wrap { padding: 14px 16px 16px; }
+    canvas { width: 100%; height: 180px; display: block; border: 1px solid var(--border); border-radius: 8px; background: #090c10; }
+    .legend { float: right; font-weight: 400; }
+    .legend b { color: var(--cyan); } .legend i { color: var(--amber); font-style: normal; }
+    @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } .trace { grid-column: auto; } }
+    @media (max-width: 440px) { main { width: calc(100% - 20px); padding: 12px 0; } header { flex-direction: column; } .metrics { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div><h1>ReSpeaker DOA Viewer</h1><p>4-Mic 实时声源方位 · 显示零点向下 · DOA 角度定义不变</p></div>
+    <span id="connection" class="status">未连接</span>
+  </header>
+  <section class="grid">
+    <section class="panel summary">
+      <div class="eyebrow">跟踪方位角</div>
+      <div id="tracked" class="angle">--.-°</div>
+      <div class="metrics">
+        <div class="metric"><span>原始角度</span><strong id="raw">--.-°</strong></div>
+        <div class="metric"><span>跟踪状态</span><strong id="trackStatus">searching</strong></div>
+        <div class="metric"><span>峰值分数</span><strong id="peak">--</strong></div>
+        <div class="metric"><span>信号电平</span><strong id="rms">-- dBFS</strong></div>
+        <div class="metric"><span>平均 MSC</span><strong id="msc">--</strong></div>
+        <div class="metric"><span>事件序号</span><strong id="seq">--</strong></div>
+      </div>
+      <div class="confidence">
+        <div class="confidence-label"><span>置信度</span><span id="confidence">0.00</span></div>
+        <div class="bar"><div id="confidenceBar"></div></div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="compass-head">四麦阵列 <span class="legend"><b>━━</b> 跟踪　<i>━</i> 原始</span></div>
+      <div class="compass-wrap">
+        <svg viewBox="0 0 360 360" role="img" aria-label="ReSpeaker DOA compass">
+          <circle class="ring" cx="180" cy="180" r="148"/><circle class="ring" cx="180" cy="180" r="100"/>
+          <line class="axis" x1="24" y1="180" x2="336" y2="180"/><line class="axis" x1="180" y1="24" x2="180" y2="336"/>
+          <text data-angle="90" x="342" y="184" fill="#8b949e" font-size="12">90°</text><text data-angle="180" x="169" y="18" fill="#8b949e" font-size="12">180°</text>
+          <text data-angle="270" x="3" y="184" fill="#8b949e" font-size="12">270°</text><text data-angle="0" x="169" y="354" fill="#8b949e" font-size="12">0°</text>
+          <rect x="128" y="128" width="104" height="104" rx="18" fill="#111820" stroke="#4b5966" stroke-width="2" transform="rotate(45 180 180)"/>
+          <circle class="mic" cx="216" cy="216" r="14"/><text class="mic-label" x="216" y="216">1</text>
+          <circle class="mic" cx="216" cy="144" r="14"/><text class="mic-label" x="216" y="144">2</text>
+          <circle class="mic" cx="144" cy="144" r="14"/><text class="mic-label" x="144" y="144">3</text>
+          <circle class="mic" cx="144" cy="216" r="14"/><text class="mic-label" x="144" y="216">4</text>
+          <line id="rawNeedle" class="raw" x1="180" y1="180" x2="180" y2="180"/>
+          <line id="trackedNeedle" class="tracked" x1="180" y1="180" x2="180" y2="180"/>
+          <circle cx="180" cy="180" r="7" fill="#f0f6fc"/>
+        </svg>
+      </div>
+    </section>
+    <section class="panel trace">
+      <div class="trace-head">最近 10 秒跟踪轨迹</div>
+      <div class="trace-wrap"><canvas id="trace" width="1040" height="180"></canvas></div>
+    </section>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const points = [];
+const canvas = $('trace');
+const ctx = canvas.getContext('2d');
+
+function angleText(value) { return Number.isFinite(value) ? value.toFixed(1) + '°' : '--.-°'; }
+function numberText(value, digits = 2) { return Number.isFinite(value) ? value.toFixed(digits) : '--'; }
+function setNeedle(element, angle, radius) {
+  if (!Number.isFinite(angle)) { element.style.opacity = '0'; return; }
+  const rad = angle * Math.PI / 180;
+  element.style.opacity = '1';
+  element.setAttribute('x2', 180 + radius * Math.sin(rad));
+  element.setAttribute('y2', 180 + radius * Math.cos(rad));
+}
+function drawTrace() {
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
+  for (const deg of [0, 90, 180, 270, 360]) {
+    const y = h - deg / 360 * h;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  if (points.length < 2) return;
+  const start = points[0].timestamp_ms, end = points.at(-1).timestamp_ms;
+  ctx.strokeStyle = '#39c5cf'; ctx.lineWidth = 3; ctx.beginPath();
+  points.forEach((point, index) => {
+    const x = end === start ? 0 : (point.timestamp_ms - start) / (end - start) * w;
+    const y = h - point.angle / 360 * h;
+    index ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+}
+function update(data) {
+  $('tracked').textContent = angleText(data.tracked_angle_deg);
+  $('raw').textContent = angleText(data.raw_angle_deg);
+  $('trackStatus').textContent = data.status || 'searching';
+  $('peak').textContent = numberText(data.peak_score, 3);
+  $('rms').textContent = numberText(data.rms_dbfs, 1) + ' dBFS';
+  $('msc').textContent = numberText(data.mean_msc, 2);
+  $('seq').textContent = data.seq;
+  $('confidence').textContent = numberText(data.confidence, 2);
+  $('confidenceBar').style.width = Math.max(0, Math.min(100, data.confidence * 100)) + '%';
+  setNeedle($('rawNeedle'), data.raw_angle_deg, 112);
+  setNeedle($('trackedNeedle'), data.tracked_angle_deg, 132);
+  if (Number.isFinite(data.tracked_angle_deg)) points.push({ timestamp_ms: data.timestamp_ms, angle: data.tracked_angle_deg });
+  const cutoff = data.timestamp_ms - 10000;
+  while (points.length && points[0].timestamp_ms < cutoff) points.shift();
+  drawTrace();
+}
+const events = new EventSource('/events');
+events.onopen = () => { $('connection').textContent = '已连接'; $('connection').className = 'status connected'; };
+events.onerror = () => { $('connection').textContent = '连接中断'; $('connection').className = 'status'; };
+events.addEventListener('doa', event => update(JSON.parse(event.data)));
+</script>
+</body>
+</html>

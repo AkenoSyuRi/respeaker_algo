@@ -12,6 +12,7 @@ mod pipeline;
 mod recorder;
 mod wasapi;
 mod wav;
+mod web;
 
 use std::path::PathBuf;
 

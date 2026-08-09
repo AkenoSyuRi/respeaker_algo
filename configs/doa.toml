@@ -3,6 +3,7 @@ version = 1
 [[modules]]
 type = "doa"
 enabled = true
+enable_viewer = true
 csv = true
 beta = 0.75
 cpsd_tau_ms = 100.0

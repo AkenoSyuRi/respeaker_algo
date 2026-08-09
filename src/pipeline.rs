@@ -7,10 +7,15 @@ use serde::Deserialize;
 
 use crate::doa::output::DoaRuntime;
 use crate::doa::{DoaConfig, DoaResult};
+use crate::web::{WebBroadcaster, WebServerHandle};
 
 const PIPELINE_CONFIG_VERSION: u32 = 1;
 
 fn default_enabled() -> bool {
+    true
+}
+
+fn default_enable_viewer() -> bool {
     true
 }
 
@@ -48,6 +53,8 @@ enum ModuleConfig {
     Doa {
         #[serde(default = "default_enabled")]
         enabled: bool,
+        #[serde(default = "default_enable_viewer")]
+        enable_viewer: bool,
         #[serde(default)]
         csv: bool,
         #[serde(default = "default_beta")]
@@ -93,6 +100,7 @@ impl PipelineConfig {
             match module {
                 ModuleConfig::Doa {
                     enabled,
+                    enable_viewer: _,
                     beta,
                     cpsd_tau_ms,
                     angle_offset_deg,
@@ -147,15 +155,20 @@ enum PipelineModuleRuntime {
 pub struct PipelineRuntime {
     modules: Vec<PipelineModuleRuntime>,
     state: PipelineState,
+    web_server: Option<WebServerHandle>,
+    web_broadcaster: Option<WebBroadcaster>,
+    doa_sequence: u64,
 }
 
 impl PipelineRuntime {
     pub fn new(config: PipelineConfig, out_dir: &str, prefix: &str) -> Result<Self, String> {
         let mut modules = Vec::new();
+        let mut doa_enable_viewer = None;
         for module in config.modules {
             match module {
                 ModuleConfig::Doa {
                     enabled,
+                    enable_viewer,
                     csv,
                     beta,
                     cpsd_tau_ms,
@@ -168,6 +181,7 @@ impl PipelineRuntime {
                     if !enabled {
                         continue;
                     }
+                    doa_enable_viewer = Some(enable_viewer);
                     let csv_path = csv.then(|| format!("{out_dir}/{prefix}_respeaker_doa.csv"));
                     modules.push(PipelineModuleRuntime::Doa(DoaRuntime::new(
                         DoaConfig {
@@ -185,19 +199,33 @@ impl PipelineRuntime {
                 }
             }
         }
+        let (web_server, web_broadcaster) = if doa_enable_viewer == Some(true) {
+            let (server, broadcaster) = WebServerHandle::start()?;
+            (Some(server), Some(broadcaster))
+        } else {
+            (None, None)
+        };
         Ok(Self {
             modules,
             state: PipelineState::default(),
+            web_server,
+            web_broadcaster,
+            doa_sequence: 0,
         })
     }
 
     pub fn push_block(&mut self, input: PipelineInputBlock<'_>) -> Result<(), String> {
         let _raw_recording_views = (input.algo, input.reference);
+        let web_broadcaster = self.web_broadcaster.clone();
         for module in &mut self.modules {
             match module {
                 PipelineModuleRuntime::Doa(runtime) => {
-                    if let Some(result) = runtime.push_block(input.mic)? {
-                        self.state.latest_doa = Some(result);
+                    for result in runtime.push_block(input.mic)? {
+                        self.state.latest_doa = Some(result.clone());
+                        self.doa_sequence += 1;
+                        if let Some(broadcaster) = &web_broadcaster {
+                            broadcaster.publish(self.doa_sequence, result)?;
+                        }
                     }
                 }
             }
@@ -210,6 +238,9 @@ impl PipelineRuntime {
             match module {
                 PipelineModuleRuntime::Doa(runtime) => runtime.finalize()?,
             }
+        }
+        if let Some(server) = &mut self.web_server {
+            server.shutdown()?;
         }
         Ok(())
     }
@@ -241,6 +272,7 @@ type = "doa"
         .unwrap();
         let ModuleConfig::Doa {
             enabled,
+            enable_viewer,
             csv,
             beta,
             cpsd_tau_ms,
@@ -251,6 +283,7 @@ type = "doa"
         } = &config.modules[0];
         let defaults = DoaConfig::default();
         assert!(*enabled);
+        assert!(*enable_viewer);
         assert!(!csv);
         assert_eq!(*beta, defaults.beta);
         assert_eq!(*cpsd_tau_ms, defaults.cpsd_tau_ms);
@@ -310,5 +343,56 @@ type = "doa"
             })
             .unwrap();
         assert_eq!((algo, mic, reference), expected);
+    }
+
+    #[test]
+    fn web_viewer_follows_enabled_doa_module() {
+        let enabled = PipelineConfig::parse(
+            r#"
+version = 1
+[[modules]]
+type = "doa"
+"#,
+        )
+        .unwrap();
+        let disabled = PipelineConfig::parse(
+            r#"
+version = 1
+[[modules]]
+type = "doa"
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        let enabled_runtime = PipelineRuntime::new(enabled, "target/out", "web_enabled").unwrap();
+        let disabled_runtime =
+            PipelineRuntime::new(disabled, "target/out", "web_disabled").unwrap();
+        assert!(enabled_runtime.web_server.is_some());
+        assert!(disabled_runtime.web_server.is_none());
+    }
+
+    #[test]
+    fn enable_viewer_false_disables_viewer_service() {
+        let config = PipelineConfig::parse(
+            r#"
+version = 1
+[[modules]]
+type = "doa"
+enable_viewer = false
+"#,
+        )
+        .unwrap();
+        let ModuleConfig::Doa {
+            enabled,
+            enable_viewer,
+            ..
+        } = &config.modules[0];
+        assert!(*enabled);
+        assert!(!*enable_viewer);
+
+        let runtime = PipelineRuntime::new(config, "target/out", "browser_disabled").unwrap();
+        assert!(runtime.web_server.is_none());
+        assert!(runtime.web_broadcaster.is_none());
     }
 }

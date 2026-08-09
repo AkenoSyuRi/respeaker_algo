@@ -5,6 +5,7 @@ ReSpeaker Mic Array v2.0（XMOS XVF-3000）Windows 专用录音与内置算法 P
 程序固定使用 WASAPI 独占模式采集 **16 kHz / 16-bit / 6 通道**交织 PCM。默认只录音；
 传入 `--pipeline-config` 时，拆分后的音频还会依次经过配置的内置 Rust 算法模块。
 当前 Pipeline 仅实现实时 4-Mic 单声源二维 DOA，后续可按顺序扩展 AEC、BF 等模块。
+启用 DOA 时还会自动打开本地实时 Web Viewer。
 
 ## 固件与通道布局
 
@@ -55,6 +56,7 @@ version = 1
 [[modules]]
 type = "doa"
 enabled = true
+enable_viewer = true
 csv = true
 beta = 0.75
 cpsd_tau_ms = 100.0
@@ -68,6 +70,13 @@ max_coast_ms = 500
 模块未写入配置即不启用；`enabled = false` 可临时关闭。当前只接受一个已启用的
 `type = "doa"`，未知模块、重复模块、版本错误或非法参数都会在启动采集前报错。
 `csv = true` 额外生成 `{prefix}_respeaker_doa.csv`。
+
+启用 DOA 且 `enable_viewer = true`（默认）时，程序绑定 `http://127.0.0.1:8765`，
+启动 ReSpeaker DOA Viewer 服务并尝试用默认浏览器打开；设为 `false` 时不启动 Viewer
+服务、SSE 或浏览器。页面实时显示原始/跟踪角度、置信度、状态和最近 10 秒轨迹，罗盘
+将算法坐标顺时针旋转 90° 显示，使 0° 指向下方；DOA 数值、CSV 和 Pipeline 状态不受
+影响。录音结束后服务随 Pipeline 关闭。该地址只监听本机，端口被占用时程序会在启动
+WASAPI 采集前报错。
 
 ## 实时 DOA
 
@@ -111,10 +120,12 @@ src/main.rs       录音 CLI 入口
 src/recorder.rs   WASAPI 采集、六通道拆分、WAV 与 Pipeline 调度
 src/wasapi.rs     Windows WASAPI 独占采集
 src/pipeline.rs   TOML 配置、模块顺序、共享状态与运行时
+src/web.rs        DOA 本地 HTTP/SSE 服务与生命周期
 src/wav.rs        标准 WAVEFORMATEX 流式写入
 src/doa/          分帧、几何、SRP、跟踪和输出
 configs/          可直接使用的 Pipeline 配置
 docs/plans/       算法与架构设计
+web/              编译期嵌入的 DOA Viewer 页面
 ```
 
 ## 验证

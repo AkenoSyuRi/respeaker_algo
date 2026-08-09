@@ -44,6 +44,7 @@ version = 1
 [[modules]]
 type = "doa"
 enabled = true
+enable_viewer = true
 csv = true
 beta = 0.75
 cpsd_tau_ms = 100.0
@@ -58,6 +59,7 @@ max_coast_ms = 500
 
 - `version` 当前必须为 `1`；
 - 当前仅支持 `type = "doa"`；未知类型必须明确报错；
+- `enable_viewer` 默认 `true`，设为 `false` 时不启动 Viewer 服务、SSE 或浏览器；
 - 同一种已启用模块最多出现一次，避免输出文件冲突；
 - 模块依赖必须由声明顺序满足；未来 BF 配置必须位于 DOA 之后，消费 DOA 发布的
   最新方向状态；

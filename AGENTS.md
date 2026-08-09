@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is a Windows-only Rust 2024 CLI for ReSpeaker Mic Array v2.0 recording and built-in algorithm pipelines. `src/main.rs` defines the recording CLI. `src/recorder.rs` coordinates fixed 16 kHz/6ch WASAPI capture, channel splitting, WAV output, and optional pipeline processing. `src/pipeline.rs` parses module configuration and runs modules in order; `src/wasapi.rs` owns exclusive capture; `src/wav.rs` writes PCM WAV files.
+This is a Windows-only Rust 2024 CLI for ReSpeaker Mic Array v2.0 recording and built-in algorithm pipelines. `src/main.rs` defines the recording CLI. `src/recorder.rs` coordinates fixed 16 kHz/6ch WASAPI capture, channel splitting, WAV output, and optional pipeline processing. `src/pipeline.rs` parses module configuration and runs modules in order; `src/web.rs` serves the embedded DOA SSE viewer from `web/`; `src/wasapi.rs` owns exclusive capture; `src/wav.rs` writes PCM WAV files.
 
 DOA code lives under `src/doa/`: framing, geometry, SRP-PHAT processing, tracking, and runtime output are separated by module. Unit tests are colocated in `#[cfg(test)]` modules. Design requirements are documented in `docs/plans/`. Generated recordings and build artifacts belong under `target/` and must not be committed.
 
@@ -13,7 +13,7 @@ DOA code lives under `src/doa/`: framing, geometry, SRP-PHAT processing, trackin
 - `cargo test --all-targets` runs deterministic tests without requiring an audio device.
 - `cargo build --release` builds the optimized CLI.
 - `cargo run -- --duration 10` performs a pure-recording Windows hardware smoke test.
-- `cargo run -- --duration 10 --pipeline-config configs/doa.toml` records while running DOA.
+- `cargo run -- --duration 10 --pipeline-config configs/doa.toml` records while running DOA and its local Web Viewer.
 
 Run the full four-command validation sequence before submitting changes.
 
