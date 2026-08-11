@@ -141,6 +141,11 @@ impl DoaConfig {
 pub struct DoaResult {
     /// 当前分析窗最后一个采样点对应的捕获时间（毫秒）。
     pub timestamp_ms: f64,
+    /// SRP 原始内部角（未做 offset/clockwise）；无有效观测时为 None。
+    #[allow(dead_code)]
+    pub raw_internal_deg: Option<f32>,
+    /// Kalman 内部角（未做 offset/clockwise）；尚未获取目标时为 None。
+    pub tracked_internal_deg: Option<f32>,
     /// SRP 原始角度（已做 offset/clockwise 转换）；无有效观测时为 None。
     pub raw_angle_deg: Option<f32>,
     /// Kalman 输出（已做 offset/clockwise 转换）；尚未获取目标时为 None。
@@ -227,13 +232,9 @@ impl DoaProcessor {
         let (observation_used, tracked_internal_deg) = self.tracker.update(obs);
 
         let conf = obs.map(|o| o.confidence).unwrap_or(0.0);
-        let raw_angle_deg = obs.map(|o| {
-            output_deg(
-                o.raw_internal_deg,
-                self.config.angle_offset_deg,
-                self.config.clockwise,
-            )
-        });
+        let raw_internal_deg = obs.map(|o| o.raw_internal_deg);
+        let raw_angle_deg = raw_internal_deg
+            .map(|deg| output_deg(deg, self.config.angle_offset_deg, self.config.clockwise));
         let tracked_angle_deg = tracked_internal_deg
             .map(|deg| output_deg(deg, self.config.angle_offset_deg, self.config.clockwise));
         let metrics = obs.unwrap_or(Observation {
@@ -249,6 +250,8 @@ impl DoaProcessor {
 
         results.push(DoaResult {
             timestamp_ms,
+            raw_internal_deg,
+            tracked_internal_deg,
             raw_angle_deg,
             tracked_angle_deg,
             confidence: conf,
@@ -526,8 +529,59 @@ mod tests {
         for r in &results {
             assert_eq!(r.confidence, 0.0);
             assert!(r.raw_angle_deg.is_none());
+            assert!(r.raw_internal_deg.is_none());
             assert_eq!(r.status, TrackStatus::Searching);
             assert!((r.rms_dbfs + 240.0).abs() < 1e-3);
         }
+    }
+
+    #[test]
+    fn doa_result_preserves_internal_angle_before_output_transform() {
+        let mut cfg = test_config();
+        cfg.angle_offset_deg = 90.0;
+        cfg.clockwise = true;
+        let mut p = DoaProcessor::new(cfg).unwrap();
+        let signal = synth_plane_wave(45.0, 1.0);
+        let mut results = Vec::new();
+        p.push_interleaved(&signal, &mut results).unwrap();
+        let tracked = results
+            .iter()
+            .rev()
+            .find(|r| r.tracked_internal_deg.is_some())
+            .expect("应有 tracked 内部角");
+        let internal = tracked.tracked_internal_deg.unwrap();
+        let external = tracked.tracked_angle_deg.unwrap();
+        let expected_ext = output_deg(internal, 90.0, true);
+        assert!(
+            circular_distance_deg(external, expected_ext) < 1e-3,
+            "external={external} expected={expected_ext} internal={internal}"
+        );
+        // 内部角不应被 offset/clockwise 污染：应接近合成 45°
+        assert!(
+            circular_distance_deg(internal, 45.0) < 8.0,
+            "internal={internal}"
+        );
+    }
+
+    #[test]
+    fn first_doa_result_occurs_at_1024_samples() {
+        let mut p = DoaProcessor::new(DoaConfig::default()).unwrap();
+        let mut results = Vec::new();
+        // 511 frames：尚无分析窗完成
+        p.push_interleaved(&vec![0i16; 511 * 4], &mut results)
+            .unwrap();
+        assert!(results.is_empty());
+        // 第 512 个 sample：frame_count=1，只 EMA
+        p.push_interleaved(&[0i16; 4], &mut results).unwrap();
+        assert!(results.is_empty());
+        // 到 768：frame_count=2
+        p.push_interleaved(&vec![0i16; 256 * 4], &mut results)
+            .unwrap();
+        assert!(results.is_empty());
+        // 到 1024：frame_count=3，首个结果
+        p.push_interleaved(&vec![0i16; 256 * 4], &mut results)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!((results[0].timestamp_ms - 64.0).abs() < 1e-6);
     }
 }

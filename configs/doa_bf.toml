@@ -1,0 +1,29 @@
+version = 1
+
+[[modules]]
+type = "doa"
+enabled = true
+enable_viewer = true
+csv = true
+beta = 0.75
+cpsd_tau_ms = 100.0
+angle_offset_deg = 0.0
+clockwise = false
+acquire_confidence = 0.65
+update_confidence = 0.40
+max_coast_ms = 500
+
+[[modules]]
+type = "beamformer"
+enabled = true
+algorithm = "robust_superdirective"
+direction_source = "doa"
+fallback_internal_angle_deg = 0.0
+direction_smoothing_ms = 64.0
+min_wng_db = 3.0
+sd_low_start_hz = 350.0
+sd_low_full_hz = 500.0
+sd_high_full_hz = 2500.0
+sd_high_end_hz = 3500.0
+output_gain_db = -3.0
+wav = true

@@ -374,6 +374,8 @@ mod tests {
     fn test_result() -> DoaResult {
         DoaResult {
             timestamp_ms: 1234.0,
+            raw_internal_deg: Some(40.0),
+            tracked_internal_deg: Some(35.0),
             raw_angle_deg: Some(40.0),
             tracked_angle_deg: Some(35.0),
             confidence: 0.62,

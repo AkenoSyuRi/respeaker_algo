@@ -7,8 +7,11 @@
 #[cfg(not(windows))]
 compile_error!("respeaker_algo 仅支持 Windows ReSpeaker WASAPI 独占录音");
 
+mod audio;
+mod beamformer;
 mod doa;
 mod pipeline;
+mod pipeline_worker;
 mod recorder;
 mod wasapi;
 mod wav;

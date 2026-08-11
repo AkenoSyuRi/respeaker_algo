@@ -16,6 +16,8 @@ pub struct WavSink {
     writer: BufWriter<File>,
     data_bytes: u64,
     finalized: bool,
+    #[cfg(test)]
+    fail_after_samples: Option<u64>,
 }
 
 impl WavSink {
@@ -45,16 +47,30 @@ impl WavSink {
             writer,
             data_bytes: 0,
             finalized: false,
+            #[cfg(test)]
+            fail_after_samples: None,
         })
     }
 
     /// 写入一个样本（交错顺序）。
     pub fn write_sample(&mut self, sample: i16) -> Result<(), String> {
+        #[cfg(test)]
+        if self
+            .fail_after_samples
+            .is_some_and(|limit| self.data_bytes / 2 >= limit)
+        {
+            return Err("注入的 WAV 写入失败".into());
+        }
         self.writer
             .write_all(&sample.to_le_bytes())
             .map_err(|e| format!("写入样本失败: {e}"))?;
         self.data_bytes += 2;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_after_samples_for_test(&mut self, samples: u64) {
+        self.fail_after_samples = Some(samples);
     }
 
     /// 批量写入样本（交错顺序）。

@@ -13,12 +13,41 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::thread;
 
 use wasapi::{
     AudioClient, DeviceCollection, Direction, SampleType, StreamMode, WasapiError, WaveFormat,
 };
+
+use crate::audio::CaptureBlock;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureSendOutcome {
+    Sent,
+    ConsumerStopped,
+}
+
+fn try_send_capture_block(
+    tx: &SyncSender<CaptureBlock>,
+    block: CaptureBlock,
+    stop: &AtomicBool,
+) -> Result<CaptureSendOutcome, String> {
+    match tx.try_send(block) {
+        Ok(()) => Ok(CaptureSendOutcome::Sent),
+        Err(TrySendError::Full(_)) => {
+            stop.store(true, Ordering::SeqCst);
+            Err("WASAPI capture queue overrun: consumer too slow".into())
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            if stop.load(Ordering::SeqCst) {
+                Ok(CaptureSendOutcome::ConsumerStopped)
+            } else {
+                Err("capture consumer disconnected unexpectedly".into())
+            }
+        }
+    }
+}
 
 /// 单个 WASAPI 输入设备的信息。
 pub struct WasapiDeviceInfo {
@@ -73,7 +102,21 @@ pub fn pick_respeaker_input_device() -> Result<WasapiDeviceInfo, String> {
 /// 采集会话句柄：Drop 时置停止标志并等待采集线程退出。
 pub struct WasapiSession {
     stop: Arc<AtomicBool>,
-    join: Option<thread::JoinHandle<()>>,
+    join: Option<thread::JoinHandle<Result<(), String>>>,
+}
+
+impl WasapiSession {
+    /// 正常路径：置 stop、join，并返回采集线程结果。
+    pub fn stop_and_join(&mut self) -> Result<(), String> {
+        self.stop.store(true, Ordering::SeqCst);
+        match self.join.take() {
+            Some(join) => match join.join() {
+                Ok(result) => result,
+                Err(_) => Err("WASAPI 采集线程 panic".into()),
+            },
+            None => Ok(()),
+        }
+    }
 }
 
 impl Drop for WasapiSession {
@@ -90,7 +133,7 @@ pub fn start_capture(
     dev: WasapiDeviceInfo,
     rate: u32,
     channels: u16,
-    tx: SyncSender<Vec<i16>>,
+    tx: SyncSender<CaptureBlock>,
     stop: Arc<AtomicBool>,
 ) -> Result<WasapiSession, String> {
     let id = dev.id;
@@ -98,11 +141,7 @@ pub fn start_capture(
     let stop_thread = Arc::clone(&stop);
     let join = thread::Builder::new()
         .name("wasapi-capture".into())
-        .spawn(move || {
-            if let Err(e) = run_capture(&id, &name, rate, channels, tx, stop_thread) {
-                eprintln!("WASAPI 采集错误: {e}");
-            }
-        })
+        .spawn(move || run_capture(&id, &name, rate, channels, tx, stop_thread))
         .map_err(|e| format!("创建采集线程失败: {e}"))?;
     Ok(WasapiSession {
         stop,
@@ -115,7 +154,7 @@ fn run_capture(
     name: &str,
     rate: u32,
     channels: u16,
-    tx: SyncSender<Vec<i16>>,
+    tx: SyncSender<CaptureBlock>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     init_com()?;
@@ -198,7 +237,8 @@ fn run_capture(
     // 独占模式下 GetNextPacketSize 不可用（wasapi-rs 直接返回 None），
     // 直接 read_from_device：返回的帧数为 0 表示当前无更多数据。
     let mut data = vec![0u8; buffer_frames as usize * frame_bytes];
-    let mut result: Result<(), String> = Ok(());
+    let mut sequence = 0u64;
+    let mut total_frames = 0u64;
 
     // 轮询模式：周期取包，1ms 空闲间隔。
     loop {
@@ -209,31 +249,82 @@ fn run_capture(
             let (frames, flags) = match capture.read_from_device(&mut data) {
                 Ok(v) => v,
                 Err(e) => {
-                    result = Err(format!("读取采集缓冲失败: {e}"));
-                    break;
+                    let _ = audio_client.stop_stream();
+                    return Err(format!("读取采集缓冲失败: {e}"));
                 }
             };
             if frames == 0 {
                 break;
             }
             let sample_count = frames as usize * channels as usize;
-            if flags.silent {
-                let _ = tx.send(vec![0i16; sample_count]);
+            let samples = if flags.silent {
+                vec![0i16; sample_count]
             } else {
                 let bytes_read = frames as usize * frame_bytes;
-                let samples: Vec<i16> = data[..bytes_read]
+                data[..bytes_read]
                     .chunks_exact(2)
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-                let _ = tx.send(samples);
+                    .collect()
+            };
+            let block = CaptureBlock::from_samples(sequence, total_frames, samples)?;
+            sequence += 1;
+            total_frames += frames as u64;
+            match try_send_capture_block(&tx, block, &stop) {
+                Ok(CaptureSendOutcome::Sent) => {}
+                Ok(CaptureSendOutcome::ConsumerStopped) => break,
+                Err(error) => {
+                    let _ = audio_client.stop_stream();
+                    return Err(error);
+                }
             }
-        }
-        if result.is_err() {
-            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 
     let _ = audio_client.stop_stream();
-    result
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::sync_channel;
+
+    fn silent_block(sequence: u64) -> CaptureBlock {
+        CaptureBlock::from_samples(sequence, sequence, vec![0i16; 6]).unwrap()
+    }
+
+    #[test]
+    fn capture_overrun_remains_fatal() {
+        let (tx, _rx) = sync_channel(1);
+        let stop = AtomicBool::new(false);
+        assert_eq!(
+            try_send_capture_block(&tx, silent_block(0), &stop).unwrap(),
+            CaptureSendOutcome::Sent
+        );
+        let error = try_send_capture_block(&tx, silent_block(1), &stop).unwrap_err();
+        assert!(error.contains("overrun"), "{error}");
+        assert!(stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn unexpected_capture_disconnect_is_an_error() {
+        let (tx, rx) = sync_channel(1);
+        drop(rx);
+        let stop = AtomicBool::new(false);
+        let error = try_send_capture_block(&tx, silent_block(0), &stop).unwrap_err();
+        assert!(error.contains("disconnected"), "{error}");
+        assert!(!stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn capture_disconnect_after_stop_is_normal() {
+        let (tx, rx) = sync_channel(1);
+        drop(rx);
+        let stop = AtomicBool::new(true);
+        assert_eq!(
+            try_send_capture_block(&tx, silent_block(0), &stop).unwrap(),
+            CaptureSendOutcome::ConsumerStopped
+        );
+    }
 }

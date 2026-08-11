@@ -5,6 +5,9 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::beamformer::{
+    BeamformerAlgorithm, BeamformerConfig, BeamformerDirectionSource, BeamformerRuntime,
+};
 use crate::doa::output::DoaRuntime;
 use crate::doa::{DoaConfig, DoaResult};
 use crate::web::{WebBroadcaster, WebServerHandle};
@@ -37,6 +40,54 @@ fn default_update_confidence() -> f32 {
 
 fn default_max_coast_ms() -> u32 {
     DoaConfig::default().max_coast_ms
+}
+
+fn default_beamformer_algorithm() -> BeamformerAlgorithm {
+    BeamformerAlgorithm::RobustSuperdirective
+}
+
+fn default_beamformer_direction_source() -> BeamformerDirectionSource {
+    BeamformerDirectionSource::Doa
+}
+
+fn default_fixed_internal_angle_deg() -> f32 {
+    0.0
+}
+
+fn default_fallback_internal_angle_deg() -> f32 {
+    0.0
+}
+
+fn default_direction_smoothing_ms() -> f32 {
+    64.0
+}
+
+fn default_min_wng_db() -> f32 {
+    3.0
+}
+
+fn default_sd_low_start_hz() -> f32 {
+    350.0
+}
+
+fn default_sd_low_full_hz() -> f32 {
+    500.0
+}
+
+fn default_sd_high_full_hz() -> f32 {
+    2500.0
+}
+
+fn default_sd_high_end_hz() -> f32 {
+    3500.0
+}
+
+fn default_output_gain_db() -> f32 {
+    -3.0
+}
+
+fn default_beamformer_wav() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -72,6 +123,34 @@ enum ModuleConfig {
         #[serde(default = "default_max_coast_ms")]
         max_coast_ms: u32,
     },
+    Beamformer {
+        #[serde(default = "default_enabled")]
+        enabled: bool,
+        #[serde(default = "default_beamformer_algorithm")]
+        algorithm: BeamformerAlgorithm,
+        #[serde(default = "default_beamformer_direction_source")]
+        direction_source: BeamformerDirectionSource,
+        #[serde(default = "default_fixed_internal_angle_deg")]
+        fixed_internal_angle_deg: f32,
+        #[serde(default = "default_fallback_internal_angle_deg")]
+        fallback_internal_angle_deg: f32,
+        #[serde(default = "default_direction_smoothing_ms")]
+        direction_smoothing_ms: f32,
+        #[serde(default = "default_min_wng_db")]
+        min_wng_db: f32,
+        #[serde(default = "default_sd_low_start_hz")]
+        sd_low_start_hz: f32,
+        #[serde(default = "default_sd_low_full_hz")]
+        sd_low_full_hz: f32,
+        #[serde(default = "default_sd_high_full_hz")]
+        sd_high_full_hz: f32,
+        #[serde(default = "default_sd_high_end_hz")]
+        sd_high_end_hz: f32,
+        #[serde(default = "default_output_gain_db")]
+        output_gain_db: f32,
+        #[serde(default = "default_beamformer_wav")]
+        wav: bool,
+    },
 }
 
 impl PipelineConfig {
@@ -81,7 +160,7 @@ impl PipelineConfig {
         Self::parse(&text).map_err(|e| format!("解析 Pipeline 配置 {} 失败: {e}", path.display()))
     }
 
-    fn parse(text: &str) -> Result<Self, String> {
+    pub(crate) fn parse(text: &str) -> Result<Self, String> {
         let config: Self = toml::from_str(text).map_err(|e| e.to_string())?;
         config.validate()?;
         Ok(config)
@@ -96,6 +175,7 @@ impl PipelineConfig {
         }
 
         let mut doa_seen = false;
+        let mut bf_seen = false;
         for module in &self.modules {
             match module {
                 ModuleConfig::Doa {
@@ -128,6 +208,51 @@ impl PipelineConfig {
                     }
                     .validate()?;
                 }
+                ModuleConfig::Beamformer {
+                    enabled,
+                    algorithm: _,
+                    direction_source,
+                    fixed_internal_angle_deg,
+                    fallback_internal_angle_deg,
+                    direction_smoothing_ms,
+                    min_wng_db,
+                    sd_low_start_hz,
+                    sd_low_full_hz,
+                    sd_high_full_hz,
+                    sd_high_end_hz,
+                    output_gain_db,
+                    wav: _,
+                } => {
+                    if !enabled {
+                        continue;
+                    }
+                    if bf_seen {
+                        return Err("Pipeline 中只能启用一个 Beamformer 模块".into());
+                    }
+                    bf_seen = true;
+                    if *direction_source == BeamformerDirectionSource::Doa && !doa_seen {
+                        return Err(
+                            "beamformer.direction_source = \"doa\" 要求配置顺序中前面已有 enabled DOA"
+                                .into(),
+                        );
+                    }
+                    BeamformerConfig {
+                        enabled: true,
+                        algorithm: BeamformerAlgorithm::DelaySum,
+                        direction_source: *direction_source,
+                        fixed_internal_angle_deg: *fixed_internal_angle_deg,
+                        fallback_internal_angle_deg: *fallback_internal_angle_deg,
+                        direction_smoothing_ms: *direction_smoothing_ms,
+                        min_wng_db: *min_wng_db,
+                        sd_low_start_hz: *sd_low_start_hz,
+                        sd_low_full_hz: *sd_low_full_hz,
+                        sd_high_full_hz: *sd_high_full_hz,
+                        sd_high_end_hz: *sd_high_end_hz,
+                        output_gain_db: *output_gain_db,
+                        wav: true,
+                    }
+                    .validate()?;
+                }
             }
         }
         Ok(())
@@ -136,19 +261,50 @@ impl PipelineConfig {
 
 /// 每个采集块的完整只读输入；模块不得修改录音缓冲。
 pub struct PipelineInputBlock<'a> {
+    pub start_frame: u64,
+    pub frames: usize,
     pub algo: &'a [i16],
     pub mic: &'a [i16],
     pub reference: &'a [i16],
 }
 
-/// 模块间共享的有类型状态。后续 BF 将消费先前 DOA 发布的结果。
+impl PipelineInputBlock<'_> {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.algo.len() != self.frames {
+            return Err(format!(
+                "PipelineInputBlock algo 长度 {} != frames {}",
+                self.algo.len(),
+                self.frames
+            ));
+        }
+        if self.mic.len() != self.frames * 4 {
+            return Err(format!(
+                "PipelineInputBlock mic 长度 {} != frames*4 {}",
+                self.mic.len(),
+                self.frames * 4
+            ));
+        }
+        if self.reference.len() != self.frames {
+            return Err(format!(
+                "PipelineInputBlock reference 长度 {} != frames {}",
+                self.reference.len(),
+                self.frames
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 模块间共享的有类型状态。
 #[derive(Default)]
 struct PipelineState {
     latest_doa: Option<DoaResult>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum PipelineModuleRuntime {
     Doa(DoaRuntime),
+    Beamformer(BeamformerRuntime),
 }
 
 /// 按配置顺序串联执行的内置算法 Pipeline。
@@ -197,6 +353,44 @@ impl PipelineRuntime {
                         csv_path.as_deref(),
                     )?));
                 }
+                ModuleConfig::Beamformer {
+                    enabled,
+                    algorithm,
+                    direction_source,
+                    fixed_internal_angle_deg,
+                    fallback_internal_angle_deg,
+                    direction_smoothing_ms,
+                    min_wng_db,
+                    sd_low_start_hz,
+                    sd_low_full_hz,
+                    sd_high_full_hz,
+                    sd_high_end_hz,
+                    output_gain_db,
+                    wav,
+                } => {
+                    if !enabled {
+                        continue;
+                    }
+                    modules.push(PipelineModuleRuntime::Beamformer(BeamformerRuntime::new(
+                        BeamformerConfig {
+                            enabled: true,
+                            algorithm,
+                            direction_source,
+                            fixed_internal_angle_deg,
+                            fallback_internal_angle_deg,
+                            direction_smoothing_ms,
+                            min_wng_db,
+                            sd_low_start_hz,
+                            sd_low_full_hz,
+                            sd_high_full_hz,
+                            sd_high_end_hz,
+                            output_gain_db,
+                            wav,
+                        },
+                        out_dir,
+                        prefix,
+                    )?));
+                }
             }
         }
         let (web_server, web_broadcaster) = if doa_enable_viewer == Some(true) {
@@ -215,7 +409,8 @@ impl PipelineRuntime {
     }
 
     pub fn push_block(&mut self, input: PipelineInputBlock<'_>) -> Result<(), String> {
-        let _raw_recording_views = (input.algo, input.reference);
+        input.validate()?;
+        let _raw_recording_views = (input.algo, input.reference, input.start_frame);
         let web_broadcaster = self.web_broadcaster.clone();
         for module in &mut self.modules {
             match module {
@@ -228,21 +423,49 @@ impl PipelineRuntime {
                         }
                     }
                 }
+                PipelineModuleRuntime::Beamformer(runtime) => {
+                    runtime.push_block(input.mic, self.state.latest_doa.as_ref())?;
+                }
             }
         }
         Ok(())
     }
 
     pub fn finalize(&mut self) -> Result<(), String> {
+        let mut first_err: Option<String> = None;
         for module in &mut self.modules {
-            match module {
-                PipelineModuleRuntime::Doa(runtime) => runtime.finalize()?,
+            let result = match module {
+                PipelineModuleRuntime::Doa(runtime) => runtime.finalize(),
+                PipelineModuleRuntime::Beamformer(runtime) => {
+                    let r = runtime.finalize();
+                    if r.is_ok() {
+                        let s = runtime.stats();
+                        println!(
+                            "BF stats: in={} out={} stft={} clipped={} das_fallback_bins={} min_wng_db={:.2}",
+                            s.input_frames,
+                            s.output_frames,
+                            s.stft_frames,
+                            s.clipped_samples,
+                            s.das_fallback_bins,
+                            s.min_generated_wng_db
+                        );
+                    }
+                    r
+                }
+            };
+            if let Err(e) = result {
+                first_err.get_or_insert(e);
             }
         }
-        if let Some(server) = &mut self.web_server {
-            server.shutdown()?;
+        if let Some(server) = &mut self.web_server
+            && let Err(e) = server.shutdown()
+        {
+            first_err.get_or_insert(e);
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -253,6 +476,12 @@ mod tests {
     #[test]
     fn bundled_doa_config_is_valid() {
         PipelineConfig::parse(include_str!("../configs/doa.toml")).unwrap();
+    }
+
+    #[test]
+    fn bundled_doa_bf_and_fixed_configs_are_valid() {
+        PipelineConfig::parse(include_str!("../configs/doa_bf.toml")).unwrap();
+        PipelineConfig::parse(include_str!("../configs/bf_fixed.toml")).unwrap();
     }
 
     #[test]
@@ -280,7 +509,10 @@ type = "doa"
             update_confidence,
             max_coast_ms,
             ..
-        } = &config.modules[0];
+        } = &config.modules[0]
+        else {
+            panic!("expected doa");
+        };
         let defaults = DoaConfig::default();
         assert!(*enabled);
         assert!(*enable_viewer);
@@ -293,15 +525,92 @@ type = "doa"
     }
 
     #[test]
+    fn beamformer_omitted_fields_match_documented_defaults() {
+        let config = PipelineConfig::parse(
+            r#"
+version = 1
+[[modules]]
+type = "beamformer"
+direction_source = "fixed"
+"#,
+        )
+        .unwrap();
+        let ModuleConfig::Beamformer {
+            enabled,
+            algorithm,
+            direction_source,
+            fixed_internal_angle_deg,
+            fallback_internal_angle_deg,
+            direction_smoothing_ms,
+            min_wng_db,
+            sd_low_start_hz,
+            sd_low_full_hz,
+            sd_high_full_hz,
+            sd_high_end_hz,
+            output_gain_db,
+            wav,
+        } = &config.modules[0]
+        else {
+            panic!("expected beamformer");
+        };
+        let d = BeamformerConfig::default();
+        assert!(*enabled);
+        assert_eq!(*algorithm, d.algorithm);
+        assert_eq!(*direction_source, BeamformerDirectionSource::Fixed);
+        assert_eq!(*fixed_internal_angle_deg, d.fixed_internal_angle_deg);
+        assert_eq!(*fallback_internal_angle_deg, d.fallback_internal_angle_deg);
+        assert_eq!(*direction_smoothing_ms, d.direction_smoothing_ms);
+        assert_eq!(*min_wng_db, d.min_wng_db);
+        assert_eq!(*sd_low_start_hz, d.sd_low_start_hz);
+        assert_eq!(*sd_low_full_hz, d.sd_low_full_hz);
+        assert_eq!(*sd_high_full_hz, d.sd_high_full_hz);
+        assert_eq!(*sd_high_end_hz, d.sd_high_end_hz);
+        assert_eq!(*output_gain_db, d.output_gain_db);
+        assert_eq!(*wav, d.wav);
+    }
+
+    #[test]
     fn rejects_invalid_version_unknown_module_duplicate_and_invalid_doa() {
         for text in [
             "version = 2",
-            "version = 1\n[[modules]]\ntype = \"bf\"",
+            "version = 1\n[[modules]]\ntype = \"unknown_mod\"",
             "version = 1\n[[modules]]\ntype = \"doa\"\n[[modules]]\ntype = \"doa\"",
             "version = 1\n[[modules]]\ntype = \"doa\"\nbeta = 1.5",
+            "version = 1\n[[modules]]\ntype = \"beamformer\"\ndirection_source = \"doa\"",
+            "version = 1\n[[modules]]\ntype = \"beamformer\"\n[[modules]]\ntype = \"beamformer\"\ndirection_source = \"fixed\"",
+            "version = 1\n[[modules]]\ntype = \"beamformer\"\ndirection_source = \"fixed\"\nsd_low_start_hz = 600\nsd_low_full_hz = 500",
         ] {
             assert!(PipelineConfig::parse(text).is_err(), "配置应被拒绝: {text}");
         }
+    }
+
+    #[test]
+    fn fixed_beamformer_without_doa_is_allowed() {
+        PipelineConfig::parse(
+            r#"
+version = 1
+[[modules]]
+type = "beamformer"
+direction_source = "fixed"
+algorithm = "delay_sum"
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn doa_before_beamformer_is_allowed() {
+        PipelineConfig::parse(
+            r#"
+version = 1
+[[modules]]
+type = "doa"
+enable_viewer = false
+[[modules]]
+type = "beamformer"
+"#,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -327,6 +636,7 @@ enabled = false
 version = 1
 [[modules]]
 type = "doa"
+enable_viewer = false
 "#,
         )
         .unwrap();
@@ -337,12 +647,15 @@ type = "doa"
         let expected = (algo.clone(), mic.clone(), reference.clone());
         runtime
             .push_block(PipelineInputBlock {
+                start_frame: 0,
+                frames: 100,
                 algo: &algo,
                 mic: &mic,
                 reference: &reference,
             })
             .unwrap();
         assert_eq!((algo, mic, reference), expected);
+        runtime.finalize().unwrap();
     }
 
     #[test]
@@ -365,11 +678,14 @@ enabled = false
         )
         .unwrap();
 
-        let enabled_runtime = PipelineRuntime::new(enabled, "target/out", "web_enabled").unwrap();
-        let disabled_runtime =
+        let mut enabled_runtime =
+            PipelineRuntime::new(enabled, "target/out", "web_enabled").unwrap();
+        let mut disabled_runtime =
             PipelineRuntime::new(disabled, "target/out", "web_disabled").unwrap();
         assert!(enabled_runtime.web_server.is_some());
         assert!(disabled_runtime.web_server.is_none());
+        enabled_runtime.finalize().unwrap();
+        disabled_runtime.finalize().unwrap();
     }
 
     #[test]
@@ -387,12 +703,16 @@ enable_viewer = false
             enabled,
             enable_viewer,
             ..
-        } = &config.modules[0];
+        } = &config.modules[0]
+        else {
+            panic!("expected doa");
+        };
         assert!(*enabled);
         assert!(!*enable_viewer);
 
-        let runtime = PipelineRuntime::new(config, "target/out", "browser_disabled").unwrap();
+        let mut runtime = PipelineRuntime::new(config, "target/out", "browser_disabled").unwrap();
         assert!(runtime.web_server.is_none());
         assert!(runtime.web_broadcaster.is_none());
+        runtime.finalize().unwrap();
     }
 }
