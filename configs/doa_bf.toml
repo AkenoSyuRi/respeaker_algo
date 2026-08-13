@@ -25,5 +25,6 @@ sd_low_start_hz = 350.0
 sd_low_full_hz = 500.0
 sd_high_full_hz = 2500.0
 sd_high_end_hz = 3500.0
-output_gain_db = -3.0
+output_gain_db = 15.0
 wav = true
+compare_wav = true

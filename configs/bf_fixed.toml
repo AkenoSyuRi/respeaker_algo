@@ -8,5 +8,6 @@ direction_source = "fixed"
 fixed_internal_angle_deg = 0.0
 fallback_internal_angle_deg = 0.0
 direction_smoothing_ms = 0.0
-output_gain_db = -3.0
+output_gain_db = 15.0
 wav = true
+compare_wav = true

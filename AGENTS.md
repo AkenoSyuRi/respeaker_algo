@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is a Windows-only Rust 2024 CLI for ReSpeaker Mic Array v2.0 recording and built-in algorithm pipelines. `src/main.rs` defines the recording CLI. `src/recorder.rs` coordinates fixed 16 kHz/6ch WASAPI capture, channel splitting, WAV output, and optional pipeline processing. `src/pipeline.rs` parses module configuration and runs modules in order; `src/web.rs` serves the embedded DOA SSE viewer from `web/`; `src/wasapi.rs` owns exclusive capture; `src/wav.rs` writes PCM WAV files.
+This is a Windows-only Rust 2024 CLI for ReSpeaker Mic Array v2.0 recording and built-in algorithm pipelines. `src/main.rs` defines the recording CLI. `src/recorder.rs` coordinates fixed 16 kHz/6ch WASAPI capture, channel splitting, and raw WAV output; `src/audio.rs` defines the `CaptureBlock` and the fixed 16 kHz/6ch device contract. `src/pipeline.rs` parses module configuration; `src/pipeline_worker.rs` runs the configured modules in a dedicated algorithm thread, assembles fixed 256-frame hops from capture blocks, and manages the bounded queue lifecycle (queue `Full` only disables the pipeline; raw recording continues). `src/beamformer/` implements Delay-and-Sum / robust superdirective MVDR weights and the streaming WOLA STFT; it consumes the DOA internal angle, while the viewer only publishes the external angle, and `compare_wav = true` writes `*_respeaker_bf.wav` as a stereo comparison (left = mic1 × gain, right = BF output × gain). `src/web.rs` serves the embedded DOA SSE viewer from `web/`; `src/wasapi.rs` owns exclusive capture; `src/wav.rs` writes PCM WAV files.
 
 DOA code lives under `src/doa/`: framing, geometry, SRP-PHAT processing, tracking, and runtime output are separated by module. Unit tests are colocated in `#[cfg(test)]` modules. Design requirements are documented in `docs/plans/`. Generated recordings and build artifacts belong under `target/` and must not be committed.
 
@@ -14,6 +14,8 @@ DOA code lives under `src/doa/`: framing, geometry, SRP-PHAT processing, trackin
 - `cargo build --release` builds the optimized CLI.
 - `cargo run -- --duration 10` performs a pure-recording Windows hardware smoke test.
 - `cargo run -- --duration 10 --pipeline-config configs/doa.toml` records while running DOA and its local Web Viewer.
+- `cargo run --release -- --duration 10 --pipeline-config configs/bf_fixed.toml` records while running the fixed-direction beamformer.
+- `cargo run --release -- --duration 10 --pipeline-config configs/doa_bf.toml` records while running DOA steering the beamformer.
 
 Run the full four-command validation sequence before submitting changes.
 

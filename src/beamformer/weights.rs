@@ -154,8 +154,10 @@ fn renormalize_distortionless(
     if n2 < 1e-20 || !n2.is_finite() {
         return None;
     }
-    let inv = Complex32::new(1.0, 0.0) / den;
-    let out = std::array::from_fn(|m| w[m] * inv);
+    // 需要 (w')^H d = c*·den = 1，即 c = 1/conj(den) = den / |den|²。
+    // 直接除 den 会残留相位旋转（仅当 den 为实数时才正确）。
+    let scale = den / n2;
+    let out = std::array::from_fn(|m| w[m] * scale);
     if !weights_finite(&out) {
         return None;
     }
@@ -417,6 +419,7 @@ mod tests {
             sd_high_end_hz: 3500.0,
             output_gain_db: -3.0,
             wav: false,
+            compare_wav: false,
         }
     }
 
@@ -464,6 +467,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn renormalize_distortionless_handles_complex_response() {
+        // den = w^H d 为纯虚数 j：旧实现（除以 den）会得到响应 -1。
+        let w = [
+            Complex32::new(1.0, 0.0),
+            Complex32::new(0.0, 0.0),
+            Complex32::new(0.0, 0.0),
+            Complex32::new(0.0, 0.0),
+        ];
+        let d = [
+            Complex32::new(0.0, 1.0),
+            Complex32::new(1.0, 0.0),
+            Complex32::new(1.0, 0.0),
+            Complex32::new(1.0, 0.0),
+        ];
+
+        let normalized = renormalize_distortionless(&w, &d).unwrap();
+        let response = wh_d(&normalized, &d);
+
+        assert!(
+            (response - Complex32::new(1.0, 0.0)).norm() < 1e-6,
+            "response={response:?}"
+        );
     }
 
     #[test]

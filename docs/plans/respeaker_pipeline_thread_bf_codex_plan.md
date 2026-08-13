@@ -735,6 +735,7 @@ Beamformer {
     sd_high_end_hz: f32,
     output_gain_db: f32,
     wav: bool,
+    compare_wav: bool, // bf.wav 写为双声道对比：左=mic1×gain、右=BF输出×gain
 }
 ```
 
@@ -830,7 +831,7 @@ Beamformer {
 
 6. `0 <= min_wng_db <= 6.0`；4 路 DAS 的理论上限约为 6.02 dB，留出数值余量。
 7. `direction_smoothing_ms >= 0`。
-8. `output_gain_db` 建议限制在 `[-24, 12]`。
+8. `output_gain_db` 建议限制在 `[-24, 24]`（高增益配置用于补偿低电平输入；超出范围拒绝）。
 9. `wav = false` 时仍运行 BF 可用于后续模块的扩展接口；本次若未实现下游音频传递，可允许但不创建输出文件。
 10. 保持 `version = 1`；这是新增可选模块，不破坏旧 `configs/doa.toml`。
 

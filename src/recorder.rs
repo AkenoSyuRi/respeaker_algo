@@ -422,16 +422,14 @@ fn finish_pipeline(
             mut worker,
             first_error: pipeline_err,
         } => {
-            // first_error 优先于 finish() == Ok
+            // first_error 优先于 finish() == Ok。worker 内部错误已在 try_push
+            // 失败时记录过，finish() 若返回同一错误则不重复追加。
             first_error.get_or_insert(pipeline_err);
             match worker.finish() {
                 Ok(stats) => Some(stats),
                 Err(e) => {
-                    if let Some(existing) = first_error.as_mut() {
-                        existing.push_str("; ");
-                        existing.push_str(&e);
-                    } else {
-                        *first_error = Some(e);
+                    if first_error.as_deref() != Some(e.as_str()) {
+                        append_err(first_error, Err(e));
                     }
                     None
                 }
@@ -613,6 +611,50 @@ mod tests {
 
         finish_pipeline(&mut pipeline, &mut first_error);
         assert_eq!(first_error.as_deref(), Some("synthetic pipeline error"));
+    }
+
+    #[test]
+    fn pipeline_worker_error_is_not_duplicated_at_finish() {
+        let config = PipelineConfig::parse(
+            r#"
+version = 1
+[[modules]]
+type = "doa"
+enable_viewer = false
+"#,
+        )
+        .unwrap();
+        let worker =
+            PipelineWorkerHandle::spawn(config, "target/out".into(), "dedup_err".into()).unwrap();
+        worker
+            .try_push(CaptureBlock::from_samples(0, 0, vec![0i16; 6 * 16]).unwrap())
+            .unwrap();
+        worker
+            .try_push(CaptureBlock::from_samples(2, 16, vec![0i16; 6 * 16]).unwrap())
+            .unwrap();
+
+        // worker 检测到不连续块后发布内部错误，此后 try_push 返回同一错误。
+        let mut pipeline_err = None;
+        for _ in 0..100_000 {
+            match worker.try_push(CaptureBlock::from_samples(3, 32, vec![0i16; 6 * 16]).unwrap()) {
+                Err(e) if e.contains("不连续") => {
+                    pipeline_err = Some(e);
+                    break;
+                }
+                _ => thread::yield_now(),
+            }
+        }
+        let pipeline_err = pipeline_err.expect("worker 应在 finish 前发布内部错误");
+
+        let mut pipeline = PipelineDispatchState::Failed {
+            worker,
+            first_error: pipeline_err.clone(),
+        };
+        let mut first_error = None;
+        finish_pipeline(&mut pipeline, &mut first_error);
+        let final_error = first_error.expect("worker 错误必须保留");
+        assert_eq!(final_error, pipeline_err);
+        assert!(!final_error.contains("; "), "错误不应重复: {final_error}");
     }
 
     #[test]

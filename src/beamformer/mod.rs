@@ -43,6 +43,9 @@ pub struct BeamformerConfig {
     pub sd_high_end_hz: f32,
     pub output_gain_db: f32,
     pub wav: bool,
+    /// `true` 时 `*_respeaker_bf.wav` 写为双声道对比文件：
+    /// 左声道 = mic1（BF 第一路输入）× output_gain_db，右声道 = BF 输出 × output_gain_db。
+    pub compare_wav: bool,
 }
 
 impl Default for BeamformerConfig {
@@ -61,6 +64,7 @@ impl Default for BeamformerConfig {
             sd_high_end_hz: 3500.0,
             output_gain_db: -3.0,
             wav: true,
+            compare_wav: false,
         }
     }
 }
@@ -106,9 +110,9 @@ impl BeamformerConfig {
                 "频率带必须满足 0 <= low_start <= low_full <= high_full <= high_end <= 8000，当前 {ls}/{lf}/{hf}/{he}"
             ));
         }
-        if !(-24.0..=12.0).contains(&self.output_gain_db) {
+        if !(-24.0..=24.0).contains(&self.output_gain_db) {
             return Err(format!(
-                "output_gain_db 建议在 [-24, 12]，当前 {}",
+                "output_gain_db 建议在 [-24, 24]，当前 {}",
                 self.output_gain_db
             ));
         }
@@ -135,6 +139,8 @@ pub struct BeamformerRuntime {
     current_deg: f32,
     gain: f32,
     pcm_scratch: Vec<i16>,
+    /// compare_wav 时积压的 mic1 原始样本，与 STFT 输出配对写入双声道文件。
+    mic0_buf: Vec<i16>,
     finalized: bool,
 }
 
@@ -144,7 +150,8 @@ impl BeamformerRuntime {
         let lut = WeightLut::generate(&config)?;
         let wav = if config.wav {
             let path = format!("{out_dir}/{prefix}_respeaker_bf.wav");
-            Some(WavSink::create(&path, 1, SAMPLE_RATE)?)
+            let channels = if config.compare_wav { 2 } else { 1 };
+            Some(WavSink::create(&path, channels, SAMPLE_RATE)?)
         } else {
             None
         };
@@ -167,6 +174,7 @@ impl BeamformerRuntime {
             current_deg: initial,
             gain,
             pcm_scratch: Vec::with_capacity(HOP_SIZE),
+            mic0_buf: Vec::with_capacity(HOP_SIZE),
             finalized: false,
         })
     }
@@ -186,6 +194,9 @@ impl BeamformerRuntime {
             ));
         }
         for frame in mics_interleaved.chunks_exact(MIC_COUNT) {
+            if self.config.compare_wav {
+                self.mic0_buf.push(frame[0]);
+            }
             let sample = [
                 frame[0] as f32 / 32768.0,
                 frame[1] as f32 / 32768.0,
@@ -211,15 +222,30 @@ impl BeamformerRuntime {
         let angle = self.current_deg;
         let weights = self.lut.weights_for(angle);
         let gain = self.gain;
+        let compare = self.config.compare_wav;
         let mut clipped = 0u64;
         let mut pcm = std::mem::take(&mut self.pcm_scratch);
+        let mut mic0 = std::mem::take(&mut self.mic0_buf);
         {
             let wav = &mut self.wav;
             self.stft
                 .flush_zeros(weights, &mut emitted, target, |samples| {
-                    write_pcm(samples, gain, &mut pcm, wav.as_mut(), &mut clipped)
+                    if compare {
+                        let input = mic0.drain(..samples.len());
+                        write_compare_pcm(
+                            input,
+                            samples,
+                            gain,
+                            &mut pcm,
+                            wav.as_mut(),
+                            &mut clipped,
+                        )
+                    } else {
+                        write_pcm(samples, gain, &mut pcm, wav.as_mut(), &mut clipped)
+                    }
                 })?;
         }
+        self.mic0_buf = mic0;
         self.pcm_scratch = pcm;
         self.stats.clipped_samples += clipped;
         self.stats.output_frames = emitted as u64;
@@ -254,13 +280,25 @@ impl BeamformerRuntime {
         let weights = self.lut.weights_for(self.current_deg);
         let out = self.stft.process_ready_hop(weights)?;
         let mut clipped = 0u64;
-        write_pcm(
-            out,
-            self.gain,
-            &mut self.pcm_scratch,
-            self.wav.as_mut(),
-            &mut clipped,
-        )?;
+        if self.config.compare_wav {
+            let input = self.mic0_buf.drain(..out.len());
+            write_compare_pcm(
+                input,
+                out,
+                self.gain,
+                &mut self.pcm_scratch,
+                self.wav.as_mut(),
+                &mut clipped,
+            )?;
+        } else {
+            write_pcm(
+                out,
+                self.gain,
+                &mut self.pcm_scratch,
+                self.wav.as_mut(),
+                &mut clipped,
+            )?;
+        }
         self.stats.clipped_samples += clipped;
         self.stats.output_frames += out.len() as u64;
         self.stats.stft_frames = self.stft.stft_frames();
@@ -299,6 +337,21 @@ pub fn smooth_direction(current: f32, target: f32, smoothing_ms: f32) -> f32 {
     wrap_360(cur + alpha * delta)
 }
 
+/// 单样本增益 + 16-bit 削波，返回 PCM 值。
+fn apply_gain(y: f32, gain: f32, clipped: &mut u64) -> i16 {
+    let v = y * gain * 32768.0;
+    let r = v.round();
+    if r > i16::MAX as f32 {
+        *clipped += 1;
+        i16::MAX
+    } else if r < i16::MIN as f32 {
+        *clipped += 1;
+        i16::MIN
+    } else {
+        r as i16
+    }
+}
+
 fn write_pcm(
     samples: &[f32],
     gain: f32,
@@ -309,18 +362,30 @@ fn write_pcm(
     scratch.clear();
     scratch.reserve(samples.len());
     for &y in samples {
-        let v = y * gain * 32768.0;
-        let r = v.round();
-        let pcm = if r > i16::MAX as f32 {
-            *clipped += 1;
-            i16::MAX
-        } else if r < i16::MIN as f32 {
-            *clipped += 1;
-            i16::MIN
-        } else {
-            r as i16
-        };
-        scratch.push(pcm);
+        scratch.push(apply_gain(y, gain, clipped));
+    }
+    if let Some(w) = wav {
+        w.write_samples(scratch)?;
+    }
+    Ok(())
+}
+
+/// 双声道对比写入：`[mic1×gain, bf_out×gain]` 逐帧交错，两声道同一时刻对齐。
+fn write_compare_pcm(
+    mic0: std::vec::Drain<'_, i16>,
+    out: &[f32],
+    gain: f32,
+    scratch: &mut Vec<i16>,
+    wav: Option<&mut WavSink>,
+    clipped: &mut u64,
+) -> Result<(), String> {
+    debug_assert_eq!(mic0.len(), out.len());
+    scratch.clear();
+    scratch.reserve(out.len() * 2);
+    for (input, &y) in mic0.zip(out) {
+        let in_f = input as f32 / 32768.0;
+        scratch.push(apply_gain(in_f, gain, clipped));
+        scratch.push(apply_gain(y, gain, clipped));
     }
     if let Some(w) = wav {
         w.write_samples(scratch)?;
@@ -359,6 +424,7 @@ mod tests {
             sd_high_end_hz: 3500.0,
             output_gain_db: 0.0,
             wav: false,
+            compare_wav: false,
         }
     }
 
@@ -583,6 +649,65 @@ mod tests {
     }
 
     #[test]
+    fn compare_wav_writes_stereo_mic1_and_bf_output() {
+        let (dir, prefix) = temp_dir_prefix("compare");
+        let mut cfg = fixed_das_config(0.0);
+        cfg.wav = true;
+        cfg.compare_wav = true;
+        cfg.output_gain_db = 0.0; // 增益 1×，输入声道可精确断言
+        let mut rt = BeamformerRuntime::new(cfg, &dir, &prefix).unwrap();
+        // 确定性输入：每帧 mic1 = 帧号，其余通道为 0。
+        let frames = HOP_SIZE * 3;
+        let mut block = Vec::with_capacity(frames * MIC_COUNT);
+        for n in 0..frames {
+            block.push(n as i16);
+            block.extend_from_slice(&[0, 0, 0]);
+        }
+        rt.push_block(&block, None).unwrap();
+        rt.finalize().unwrap();
+        assert_eq!(rt.stats().output_frames, rt.stats().input_frames);
+
+        let path = format!("{dir}/{prefix}_respeaker_bf.wav");
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.spec().channels, 2);
+        assert_eq!(reader.spec().sample_rate, 16_000);
+        let samples: Vec<i16> = reader.samples::<i16>().map(Result::unwrap).collect();
+        assert_eq!(samples.len(), frames * 2);
+        // 左声道 = mic1 原始样本（增益 1×，逐帧配对）；右声道 = BF 输出，不应全零。
+        let mut output_nonzero = false;
+        for (k, pair) in samples.chunks_exact(2).enumerate() {
+            assert_eq!(pair[0], k as i16, "输入声道第 {k} 帧");
+            output_nonzero |= pair[1] != 0;
+        }
+        assert!(output_nonzero, "输出声道应有非零样本");
+    }
+
+    #[test]
+    fn compare_wav_applies_gain_to_both_channels() {
+        let (dir, prefix) = temp_dir_prefix("compare_gain");
+        let mut cfg = fixed_das_config(0.0);
+        cfg.wav = true;
+        cfg.compare_wav = true;
+        cfg.output_gain_db = 20.0; // 约 10 倍，输入声道应被放大并削波到满幅
+        let mut rt = BeamformerRuntime::new(cfg, &dir, &prefix).unwrap();
+        let block: Vec<i16> = (0..HOP_SIZE * 2)
+            .flat_map(|_| [i16::MAX, 0, 0, 0])
+            .collect();
+        rt.push_block(&block, None).unwrap();
+        rt.finalize().unwrap();
+        assert!(rt.stats().clipped_samples > 0, "增益后应有削波统计");
+
+        let path = format!("{dir}/{prefix}_respeaker_bf.wav");
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.spec().channels, 2);
+        let samples: Vec<i16> = reader.samples::<i16>().map(Result::unwrap).collect();
+        for pair in samples.chunks_exact(2) {
+            // 满幅输入 × 10 倍 → 输入声道应削波到 i16::MAX。
+            assert_eq!(pair[0], i16::MAX, "输入声道应满幅削波");
+        }
+    }
+
+    #[test]
     fn config_validate_frequency_and_wng() {
         let mut cfg = BeamformerConfig::default();
         assert!(cfg.validate().is_ok());
@@ -590,6 +715,12 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.min_wng_db = 3.0;
         cfg.sd_low_full_hz = 100.0; // < low_start
+        assert!(cfg.validate().is_err());
+        cfg.sd_low_full_hz = 500.0;
+        // 高增益配置（如 20 dB）必须在允许范围内，超出后拒绝。
+        cfg.output_gain_db = 20.0;
+        assert!(cfg.validate().is_ok());
+        cfg.output_gain_db = 25.0;
         assert!(cfg.validate().is_err());
         let _ = FFT_BINS;
     }

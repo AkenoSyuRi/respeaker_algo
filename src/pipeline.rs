@@ -90,6 +90,10 @@ fn default_beamformer_wav() -> bool {
     true
 }
 
+fn default_compare_wav() -> bool {
+    false
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
@@ -150,6 +154,8 @@ enum ModuleConfig {
         output_gain_db: f32,
         #[serde(default = "default_beamformer_wav")]
         wav: bool,
+        #[serde(default = "default_compare_wav")]
+        compare_wav: bool,
     },
 }
 
@@ -210,7 +216,7 @@ impl PipelineConfig {
                 }
                 ModuleConfig::Beamformer {
                     enabled,
-                    algorithm: _,
+                    algorithm,
                     direction_source,
                     fixed_internal_angle_deg,
                     fallback_internal_angle_deg,
@@ -221,7 +227,8 @@ impl PipelineConfig {
                     sd_high_full_hz,
                     sd_high_end_hz,
                     output_gain_db,
-                    wav: _,
+                    wav,
+                    compare_wav,
                 } => {
                     if !enabled {
                         continue;
@@ -238,7 +245,7 @@ impl PipelineConfig {
                     }
                     BeamformerConfig {
                         enabled: true,
-                        algorithm: BeamformerAlgorithm::DelaySum,
+                        algorithm: *algorithm,
                         direction_source: *direction_source,
                         fixed_internal_angle_deg: *fixed_internal_angle_deg,
                         fallback_internal_angle_deg: *fallback_internal_angle_deg,
@@ -249,7 +256,8 @@ impl PipelineConfig {
                         sd_high_full_hz: *sd_high_full_hz,
                         sd_high_end_hz: *sd_high_end_hz,
                         output_gain_db: *output_gain_db,
-                        wav: true,
+                        wav: *wav,
+                        compare_wav: *compare_wav,
                     }
                     .validate()?;
                 }
@@ -367,6 +375,7 @@ impl PipelineRuntime {
                     sd_high_end_hz,
                     output_gain_db,
                     wav,
+                    compare_wav,
                 } => {
                     if !enabled {
                         continue;
@@ -386,6 +395,7 @@ impl PipelineRuntime {
                             sd_high_end_hz,
                             output_gain_db,
                             wav,
+                            compare_wav,
                         },
                         out_dir,
                         prefix,
@@ -549,6 +559,7 @@ direction_source = "fixed"
             sd_high_end_hz,
             output_gain_db,
             wav,
+            compare_wav,
         } = &config.modules[0]
         else {
             panic!("expected beamformer");
@@ -567,6 +578,38 @@ direction_source = "fixed"
         assert_eq!(*sd_high_end_hz, d.sd_high_end_hz);
         assert_eq!(*output_gain_db, d.output_gain_db);
         assert_eq!(*wav, d.wav);
+        assert_eq!(*compare_wav, d.compare_wav);
+        assert!(!d.compare_wav);
+    }
+
+    #[test]
+    fn beamformer_validate_passes_through_algorithm_wav_and_compare() {
+        let config = PipelineConfig::parse(
+            r#"
+version = 1
+[[modules]]
+type = "beamformer"
+direction_source = "fixed"
+algorithm = "robust_superdirective"
+wav = false
+compare_wav = true
+"#,
+        )
+        .unwrap();
+        let ModuleConfig::Beamformer {
+            algorithm,
+            wav,
+            compare_wav,
+            ..
+        } = &config.modules[0]
+        else {
+            panic!("expected beamformer");
+        };
+        // 校验必须按用户配置的 algorithm / wav / compare_wav 原值构造，而非写死默认值。
+        assert_eq!(*algorithm, BeamformerAlgorithm::RobustSuperdirective);
+        assert!(!wav);
+        assert!(*compare_wav);
+        config.validate().unwrap();
     }
 
     #[test]

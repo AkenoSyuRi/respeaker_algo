@@ -36,7 +36,7 @@ wasapi-capture          recorder loop           algorithm-worker（仅有 pipeli
 | ch0 | 固件算法处理音频 | `*_respeaker_algo.wav` |
 | ch1–ch4 | mic1–mic4 原始数据 | `*_respeaker_mic.wav`（4ch） |
 | ch5 | 回放/AEC 参考 | `*_respeaker_ref.wav` |
-| — | Beamformer 输出（可选） | `*_respeaker_bf.wav`（mono） |
+| — | Beamformer 输出（可选） | `*_respeaker_bf.wav`（mono；`compare_wav = true` 时为双声道：左=mic1+增益、右=BF输出+增益） |
 
 输出为标准 16-bit PCM `WAVEFORMATEX`，不写入扬声器布局 channel mask。
 
@@ -54,13 +54,13 @@ target\release\respeaker_algo.exe `
   --out-dir target/out `
   --pipeline-config configs/doa.toml
 
-# DOA + 鲁棒超指向 BF
+# DOA + 鲁棒超指向 BF（15 dB 输出增益，双声道对比）
 target\release\respeaker_algo.exe `
   --duration 30 `
   --out-dir target/out `
   --pipeline-config configs/doa_bf.toml
 
-# 固定角 Delay-and-Sum BF（无 DOA）
+# 固定角 Delay-and-Sum BF（无 DOA，15 dB 输出增益，双声道对比）
 target\release\respeaker_algo.exe `
   --duration 30 `
   --out-dir target/out `
@@ -77,12 +77,13 @@ CLI 仅提供 `--duration`、`--out-dir`、`--prefix`、`--pipeline-config`。
 示例：
 
 - [configs/doa.toml](configs/doa.toml) — 仅 DOA
-- [configs/doa_bf.toml](configs/doa_bf.toml) — DOA + robust superdirective BF
-- [configs/bf_fixed.toml](configs/bf_fixed.toml) — 固定角 Delay-and-Sum
+- [configs/doa_bf.toml](configs/doa_bf.toml) — DOA + robust superdirective BF（15 dB，双声道对比）
+- [configs/bf_fixed.toml](configs/bf_fixed.toml) — 固定角 Delay-and-Sum（15 dB，双声道对比）
 
 Beamformer 可省略字段的默认值：`algorithm = robust_superdirective`、
 `direction_source = doa`、`direction_smoothing_ms = 64`、`min_wng_db = 3`、
-频带 `350/500/2500/3500` Hz、`output_gain_db = -3`、`wav = true`。
+频带 `350/500/2500/3500` Hz、`output_gain_db = -3`、`wav = true`、
+`compare_wav = false`。
 
 ## 角度坐标
 
