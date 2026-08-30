@@ -11,3 +11,4 @@ direction_smoothing_ms = 0.0
 output_gain_db = 15.0
 wav = true
 compare_wav = true
+enable_drc = true

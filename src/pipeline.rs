@@ -156,6 +156,8 @@ enum ModuleConfig {
         wav: bool,
         #[serde(default = "default_compare_wav")]
         compare_wav: bool,
+        #[serde(default)]
+        enable_drc: bool,
     },
 }
 
@@ -229,6 +231,7 @@ impl PipelineConfig {
                     output_gain_db,
                     wav,
                     compare_wav,
+                    enable_drc,
                 } => {
                     if !enabled {
                         continue;
@@ -258,6 +261,7 @@ impl PipelineConfig {
                         output_gain_db: *output_gain_db,
                         wav: *wav,
                         compare_wav: *compare_wav,
+                        enable_drc: *enable_drc,
                     }
                     .validate()?;
                 }
@@ -376,6 +380,7 @@ impl PipelineRuntime {
                     output_gain_db,
                     wav,
                     compare_wav,
+                    enable_drc,
                 } => {
                     if !enabled {
                         continue;
@@ -396,6 +401,7 @@ impl PipelineRuntime {
                             output_gain_db,
                             wav,
                             compare_wav,
+                            enable_drc,
                         },
                         out_dir,
                         prefix,
@@ -560,6 +566,7 @@ direction_source = "fixed"
             output_gain_db,
             wav,
             compare_wav,
+            enable_drc,
         } = &config.modules[0]
         else {
             panic!("expected beamformer");
@@ -580,6 +587,8 @@ direction_source = "fixed"
         assert_eq!(*wav, d.wav);
         assert_eq!(*compare_wav, d.compare_wav);
         assert!(!d.compare_wav);
+        assert_eq!(*enable_drc, d.enable_drc);
+        assert!(!d.enable_drc);
     }
 
     #[test]
@@ -593,6 +602,7 @@ direction_source = "fixed"
 algorithm = "robust_superdirective"
 wav = false
 compare_wav = true
+enable_drc = true
 "#,
         )
         .unwrap();
@@ -600,6 +610,7 @@ compare_wav = true
             algorithm,
             wav,
             compare_wav,
+            enable_drc,
             ..
         } = &config.modules[0]
         else {
@@ -609,6 +620,7 @@ compare_wav = true
         assert_eq!(*algorithm, BeamformerAlgorithm::RobustSuperdirective);
         assert!(!wav);
         assert!(*compare_wav);
+        assert!(*enable_drc);
         config.validate().unwrap();
     }
 

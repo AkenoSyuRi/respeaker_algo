@@ -420,6 +420,7 @@ mod tests {
             output_gain_db: -3.0,
             wav: false,
             compare_wav: false,
+            enable_drc: false,
         }
     }
 

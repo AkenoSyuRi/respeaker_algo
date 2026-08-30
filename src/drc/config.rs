@@ -1,0 +1,58 @@
+#[derive(Clone, Debug)]
+pub struct DrcConfig {
+    pub gate_enabled: bool,
+    pub gate_open_threshold_db: f32,
+    pub gate_close_threshold_db: f32,
+    pub gate_attack_s: f32,
+    pub gate_release_s: f32,
+    pub gate_hold_ms: f32,
+    pub gate_floor_db: f32,
+    pub pregain_db: f32,
+    pub compressor_threshold_db: f32,
+    pub compressor_knee_db: f32,
+    pub compressor_ratio: f32,
+    pub compressor_attack_s: f32,
+    pub compressor_release_s: f32,
+    pub predelay_s: f32,
+    pub release_zone1: f32,
+    pub release_zone2: f32,
+    pub release_zone3: f32,
+    pub release_zone4: f32,
+    pub postgain_db: f32,
+    pub wet: f32,
+    pub auto_makeup_gain: bool,
+    pub limiter_enabled: bool,
+    pub limiter_ceiling_dbfs: f32,
+    pub limiter_release_s: f32,
+}
+
+impl DrcConfig {
+    pub fn pipeline() -> Self {
+        Self {
+            gate_enabled: true,
+            gate_open_threshold_db: -48.0,
+            gate_close_threshold_db: -54.0,
+            gate_attack_s: 0.003,
+            gate_release_s: 0.050,
+            gate_hold_ms: 10.0,
+            gate_floor_db: -80.0,
+            pregain_db: 5.0,
+            compressor_threshold_db: -20.0,
+            compressor_knee_db: 25.0,
+            compressor_ratio: 8.0,
+            compressor_attack_s: 0.001,
+            compressor_release_s: 0.600,
+            predelay_s: 0.002,
+            release_zone1: 0.090,
+            release_zone2: 0.160,
+            release_zone3: 0.420,
+            release_zone4: 0.980,
+            postgain_db: 0.0,
+            wet: 1.0,
+            auto_makeup_gain: false,
+            limiter_enabled: true,
+            limiter_ceiling_dbfs: -1.0,
+            limiter_release_s: 0.050,
+        }
+    }
+}

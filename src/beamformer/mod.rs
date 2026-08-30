@@ -10,6 +10,7 @@ use crate::beamformer::stft::BeamformerStft;
 use crate::beamformer::weights::WeightLut;
 use crate::doa::tracker::TrackStatus;
 use crate::doa::{DoaResult, HOP_SIZE, MIC_COUNT, SAMPLE_RATE, circular_delta_deg, wrap_360};
+use crate::drc::TssDrc;
 use crate::wav::WavSink;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -46,6 +47,7 @@ pub struct BeamformerConfig {
     /// `true` 时 `*_respeaker_bf.wav` 写为双声道对比文件：
     /// 左声道 = mic1（BF 第一路输入）× output_gain_db，右声道 = BF 输出 × output_gain_db。
     pub compare_wav: bool,
+    pub enable_drc: bool,
 }
 
 impl Default for BeamformerConfig {
@@ -65,6 +67,7 @@ impl Default for BeamformerConfig {
             output_gain_db: -3.0,
             wav: true,
             compare_wav: false,
+            enable_drc: false,
         }
     }
 }
@@ -141,6 +144,13 @@ pub struct BeamformerRuntime {
     pcm_scratch: Vec<i16>,
     /// compare_wav 时积压的 mic1 原始样本，与 STFT 输出配对写入双声道文件。
     mic0_buf: Vec<i16>,
+    float_scratch: Vec<f32>,
+    drc_bf: Option<TssDrc>,
+    drc_mic: Option<TssDrc>,
+    #[cfg(test)]
+    gained_bf: Vec<f32>,
+    #[cfg(test)]
+    gained_mic: Vec<f32>,
     finalized: bool,
 }
 
@@ -165,6 +175,22 @@ impl BeamformerRuntime {
             min_generated_wng_db: lut.min_generated_wng_db,
             ..BeamformerStats::default()
         };
+        let wav_channels = if config.compare_wav { 2 } else { 1 };
+        let pcm_cap = wav_channels * HOP_SIZE;
+        let (drc_bf, drc_mic) = if config.enable_drc {
+            (
+                Some(TssDrc::pipeline(SAMPLE_RATE)?),
+                if config.compare_wav {
+                    Some(TssDrc::pipeline(SAMPLE_RATE)?)
+                } else {
+                    None
+                },
+            )
+        } else {
+            (None, None)
+        };
+        let mut float_scratch = Vec::with_capacity(HOP_SIZE);
+        float_scratch.resize(HOP_SIZE, 0.0);
         Ok(Self {
             config,
             lut,
@@ -173,8 +199,15 @@ impl BeamformerRuntime {
             stats,
             current_deg: initial,
             gain,
-            pcm_scratch: Vec::with_capacity(HOP_SIZE),
-            mic0_buf: Vec::with_capacity(HOP_SIZE),
+            pcm_scratch: Vec::with_capacity(pcm_cap),
+            mic0_buf: Vec::with_capacity(2 * HOP_SIZE),
+            float_scratch,
+            drc_bf,
+            drc_mic,
+            #[cfg(test)]
+            gained_bf: Vec::new(),
+            #[cfg(test)]
+            gained_mic: Vec::new(),
             finalized: false,
         })
     }
@@ -226,27 +259,41 @@ impl BeamformerRuntime {
         let mut clipped = 0u64;
         let mut pcm = std::mem::take(&mut self.pcm_scratch);
         let mut mic0 = std::mem::take(&mut self.mic0_buf);
-        {
-            let wav = &mut self.wav;
+        let mut float_scratch = std::mem::take(&mut self.float_scratch);
+        let mut drc_bf = self.drc_bf.take();
+        let mut drc_mic = self.drc_mic.take();
+        #[cfg(test)]
+        let mut gained_bf = std::mem::take(&mut self.gained_bf);
+        #[cfg(test)]
+        let mut gained_mic = std::mem::take(&mut self.gained_mic);
+        let flush_result = {
+            let mut writer = PcmWrite {
+                pcm: &mut pcm,
+                wav: self.wav.as_mut(),
+                clipped: &mut clipped,
+                float_scratch: &mut float_scratch,
+                #[cfg(test)]
+                gained_bf: &mut gained_bf,
+                #[cfg(test)]
+                gained_mic: &mut gained_mic,
+            };
             self.stft
                 .flush_zeros(weights, &mut emitted, target, |samples| {
-                    if compare {
-                        let input = mic0.drain(..samples.len());
-                        write_compare_pcm(
-                            input,
-                            samples,
-                            gain,
-                            &mut pcm,
-                            wav.as_mut(),
-                            &mut clipped,
-                        )
-                    } else {
-                        write_pcm(samples, gain, &mut pcm, wav.as_mut(), &mut clipped)
-                    }
-                })?;
-        }
+                    writer.write_hop(samples, gain, compare, &mut mic0, &mut drc_bf, &mut drc_mic)
+                })
+                .and_then(|()| writer.flush_drc(&mut drc_bf, &mut drc_mic, compare))
+        };
         self.mic0_buf = mic0;
         self.pcm_scratch = pcm;
+        self.float_scratch = float_scratch;
+        self.drc_bf = drc_bf;
+        self.drc_mic = drc_mic;
+        #[cfg(test)]
+        {
+            self.gained_bf = gained_bf;
+            self.gained_mic = gained_mic;
+        }
+        flush_result?;
         self.stats.clipped_samples += clipped;
         self.stats.output_frames = emitted as u64;
         self.stats.stft_frames = self.stft.stft_frames();
@@ -273,6 +320,25 @@ impl BeamformerRuntime {
         self.current_deg
     }
 
+    #[cfg(test)]
+    fn scratch_capacities(&self) -> (usize, usize, usize) {
+        (
+            self.pcm_scratch.capacity(),
+            self.float_scratch.capacity(),
+            self.mic0_buf.capacity(),
+        )
+    }
+
+    #[cfg(test)]
+    fn gained_bf(&self) -> &[f32] {
+        &self.gained_bf
+    }
+
+    #[cfg(test)]
+    fn gained_mic(&self) -> &[f32] {
+        &self.gained_mic
+    }
+
     fn on_hop(&mut self, latest_doa: Option<&DoaResult>) -> Result<(), String> {
         let target = select_target_angle(&self.config, latest_doa);
         self.current_deg =
@@ -280,23 +346,26 @@ impl BeamformerRuntime {
         let weights = self.lut.weights_for(self.current_deg);
         let out = self.stft.process_ready_hop(weights)?;
         let mut clipped = 0u64;
-        if self.config.compare_wav {
-            let input = self.mic0_buf.drain(..out.len());
-            write_compare_pcm(
-                input,
+        let compare = self.config.compare_wav;
+        let gain = self.gain;
+        {
+            let mut writer = PcmWrite {
+                pcm: &mut self.pcm_scratch,
+                wav: self.wav.as_mut(),
+                clipped: &mut clipped,
+                float_scratch: &mut self.float_scratch,
+                #[cfg(test)]
+                gained_bf: &mut self.gained_bf,
+                #[cfg(test)]
+                gained_mic: &mut self.gained_mic,
+            };
+            writer.write_hop(
                 out,
-                self.gain,
-                &mut self.pcm_scratch,
-                self.wav.as_mut(),
-                &mut clipped,
-            )?;
-        } else {
-            write_pcm(
-                out,
-                self.gain,
-                &mut self.pcm_scratch,
-                self.wav.as_mut(),
-                &mut clipped,
+                gain,
+                compare,
+                &mut self.mic0_buf,
+                &mut self.drc_bf,
+                &mut self.drc_mic,
             )?;
         }
         self.stats.clipped_samples += clipped;
@@ -337,10 +406,96 @@ pub fn smooth_direction(current: f32, target: f32, smoothing_ms: f32) -> f32 {
     wrap_360(cur + alpha * delta)
 }
 
-/// 单样本增益 + 16-bit 削波，返回 PCM 值。
-fn apply_gain(y: f32, gain: f32, clipped: &mut u64) -> i16 {
-    let v = y * gain * 32768.0;
-    let r = v.round();
+struct PcmWrite<'a> {
+    pcm: &'a mut Vec<i16>,
+    wav: Option<&'a mut WavSink>,
+    clipped: &'a mut u64,
+    float_scratch: &'a mut [f32],
+    #[cfg(test)]
+    gained_bf: &'a mut Vec<f32>,
+    #[cfg(test)]
+    gained_mic: &'a mut Vec<f32>,
+}
+
+impl PcmWrite<'_> {
+    fn write_wav(&mut self) -> Result<(), String> {
+        if let Some(wav) = self.wav.as_mut() {
+            wav.write_samples(self.pcm)?;
+        }
+        Ok(())
+    }
+
+    fn write_hop(
+        &mut self,
+        samples: &[f32],
+        gain: f32,
+        compare: bool,
+        mic0: &mut Vec<i16>,
+        drc_bf: &mut Option<TssDrc>,
+        drc_mic: &mut Option<TssDrc>,
+    ) -> Result<(), String> {
+        if let Some(drc) = drc_bf.as_mut() {
+            if compare {
+                let Some(drc_m) = drc_mic.as_mut() else {
+                    return Err("compare_wav DRC 缺少 mic 实例".into());
+                };
+                let input = mic0.drain(..samples.len());
+                write_compare_pcm_with_drc(input, samples, gain, drc_m, drc, self)
+            } else {
+                write_pcm_with_drc(samples, gain, drc, self)
+            }
+        } else if compare {
+            let input = mic0.drain(..samples.len());
+            write_compare_pcm(input, samples, gain, self)
+        } else {
+            write_pcm(samples, gain, self)
+        }
+    }
+
+    fn flush_drc(
+        &mut self,
+        drc_bf: &mut Option<TssDrc>,
+        drc_mic: &mut Option<TssDrc>,
+        compare: bool,
+    ) -> Result<(), String> {
+        let Some(drc) = drc_bf.as_mut() else {
+            return Ok(());
+        };
+        let n = drc.latency_samples();
+        debug_assert!(self.float_scratch.len() >= n);
+        drc.flush(&mut self.float_scratch[..n]);
+        if compare {
+            let Some(drc_m) = drc_mic.as_mut() else {
+                return Err("compare_wav DRC 缺少 mic 实例".into());
+            };
+            debug_assert!(self.pcm.capacity() >= 2 * n);
+            self.pcm.clear();
+            self.pcm.resize(2 * n, 0);
+            for (i, &y) in self.float_scratch[..n].iter().enumerate() {
+                self.pcm[i * 2 + 1] = float_to_pcm(y, self.clipped);
+            }
+            let n_mic = drc_m.latency_samples();
+            debug_assert_eq!(n_mic, n);
+            debug_assert!(self.float_scratch.len() >= n_mic);
+            drc_m.flush(&mut self.float_scratch[..n_mic]);
+            for (i, &y) in self.float_scratch[..n_mic].iter().enumerate() {
+                self.pcm[i * 2] = float_to_pcm(y, self.clipped);
+            }
+        } else {
+            debug_assert!(self.pcm.capacity() >= n);
+            self.pcm.clear();
+            self.pcm.resize(n, 0);
+            for (i, &y) in self.float_scratch[..n].iter().enumerate() {
+                self.pcm[i] = float_to_pcm(y, self.clipped);
+            }
+        }
+        self.write_wav()
+    }
+}
+
+/// 已是线性域的浮点样本 → 16-bit 削波。
+fn float_to_pcm(y: f32, clipped: &mut u64) -> i16 {
+    let r = (y * 32768.0).round();
     if r > i16::MAX as f32 {
         *clipped += 1;
         i16::MAX
@@ -352,22 +507,19 @@ fn apply_gain(y: f32, gain: f32, clipped: &mut u64) -> i16 {
     }
 }
 
-fn write_pcm(
-    samples: &[f32],
-    gain: f32,
-    scratch: &mut Vec<i16>,
-    wav: Option<&mut WavSink>,
-    clipped: &mut u64,
-) -> Result<(), String> {
-    scratch.clear();
-    scratch.reserve(samples.len());
-    for &y in samples {
-        scratch.push(apply_gain(y, gain, clipped));
+/// 单样本增益 + 16-bit 削波，返回 PCM 值。
+fn apply_gain(y: f32, gain: f32, clipped: &mut u64) -> i16 {
+    float_to_pcm(y * gain, clipped)
+}
+
+fn write_pcm(samples: &[f32], gain: f32, w: &mut PcmWrite<'_>) -> Result<(), String> {
+    debug_assert!(w.pcm.capacity() >= samples.len());
+    w.pcm.clear();
+    w.pcm.resize(samples.len(), 0);
+    for (i, &y) in samples.iter().enumerate() {
+        w.pcm[i] = apply_gain(y, gain, w.clipped);
     }
-    if let Some(w) = wav {
-        w.write_samples(scratch)?;
-    }
-    Ok(())
+    w.write_wav()
 }
 
 /// 双声道对比写入：`[mic1×gain, bf_out×gain]` 逐帧交错，两声道同一时刻对齐。
@@ -375,22 +527,78 @@ fn write_compare_pcm(
     mic0: std::vec::Drain<'_, i16>,
     out: &[f32],
     gain: f32,
-    scratch: &mut Vec<i16>,
-    wav: Option<&mut WavSink>,
-    clipped: &mut u64,
+    w: &mut PcmWrite<'_>,
 ) -> Result<(), String> {
     debug_assert_eq!(mic0.len(), out.len());
-    scratch.clear();
-    scratch.reserve(out.len() * 2);
-    for (input, &y) in mic0.zip(out) {
+    debug_assert!(w.pcm.capacity() >= out.len() * 2);
+    w.pcm.clear();
+    w.pcm.resize(out.len() * 2, 0);
+    for (i, (input, &y)) in mic0.zip(out).enumerate() {
         let in_f = input as f32 / 32768.0;
-        scratch.push(apply_gain(in_f, gain, clipped));
-        scratch.push(apply_gain(y, gain, clipped));
+        w.pcm[i * 2] = apply_gain(in_f, gain, w.clipped);
+        w.pcm[i * 2 + 1] = apply_gain(y, gain, w.clipped);
     }
-    if let Some(w) = wav {
-        w.write_samples(scratch)?;
+    w.write_wav()
+}
+
+fn write_pcm_with_drc(
+    samples: &[f32],
+    gain: f32,
+    drc: &mut TssDrc,
+    w: &mut PcmWrite<'_>,
+) -> Result<(), String> {
+    debug_assert!(w.float_scratch.len() >= samples.len());
+    debug_assert!(w.pcm.capacity() >= samples.len());
+    w.pcm.clear();
+    w.pcm.resize(samples.len(), 0);
+    for (i, &y) in samples.iter().enumerate() {
+        let gained = y * gain;
+        #[cfg(test)]
+        w.gained_bf.push(gained);
+        w.float_scratch[i] = gained;
     }
-    Ok(())
+    drc.process_in_place(&mut w.float_scratch[..samples.len()]);
+    for (i, y) in w.float_scratch[..samples.len()].iter().enumerate() {
+        w.pcm[i] = float_to_pcm(*y, w.clipped);
+    }
+    w.write_wav()
+}
+
+fn write_compare_pcm_with_drc(
+    mic0: std::vec::Drain<'_, i16>,
+    out: &[f32],
+    gain: f32,
+    drc_mic: &mut TssDrc,
+    drc_bf: &mut TssDrc,
+    w: &mut PcmWrite<'_>,
+) -> Result<(), String> {
+    let n = out.len();
+    debug_assert_eq!(mic0.len(), n);
+    debug_assert!(w.float_scratch.len() >= n);
+    debug_assert!(w.pcm.capacity() >= 2 * n);
+    for (i, input) in mic0.enumerate() {
+        let gained = (input as f32 / 32768.0) * gain;
+        #[cfg(test)]
+        w.gained_mic.push(gained);
+        w.float_scratch[i] = gained;
+    }
+    drc_mic.process_in_place(&mut w.float_scratch[..n]);
+    w.pcm.clear();
+    w.pcm.resize(2 * n, 0);
+    for (i, &y) in w.float_scratch[..n].iter().enumerate() {
+        w.pcm[i * 2] = float_to_pcm(y, w.clipped);
+    }
+    for (i, &y) in out.iter().enumerate() {
+        let gained = y * gain;
+        #[cfg(test)]
+        w.gained_bf.push(gained);
+        w.float_scratch[i] = gained;
+    }
+    drc_bf.process_in_place(&mut w.float_scratch[..n]);
+    for (i, &y) in w.float_scratch[..n].iter().enumerate() {
+        w.pcm[i * 2 + 1] = float_to_pcm(y, w.clipped);
+    }
+    w.write_wav()
 }
 
 #[cfg(test)]
@@ -425,6 +633,7 @@ mod tests {
             output_gain_db: 0.0,
             wav: false,
             compare_wav: false,
+            enable_drc: false,
         }
     }
 
@@ -723,5 +932,158 @@ mod tests {
         cfg.output_gain_db = 25.0;
         assert!(cfg.validate().is_err());
         let _ = FFT_BINS;
+    }
+
+    #[test]
+    fn enable_drc_false_keeps_compare_length() {
+        let (dir, prefix) = temp_dir_prefix("drc_off");
+        let mut cfg = fixed_das_config(0.0);
+        cfg.wav = true;
+        cfg.compare_wav = true;
+        cfg.enable_drc = false;
+        cfg.output_gain_db = 0.0;
+        let frames = HOP_SIZE * 3;
+        let mut block = Vec::with_capacity(frames * MIC_COUNT);
+        for n in 0..frames {
+            block.push(n as i16);
+            block.extend_from_slice(&[0, 0, 0]);
+        }
+        let mut rt = BeamformerRuntime::new(cfg, &dir, &prefix).unwrap();
+        rt.push_block(&block, None).unwrap();
+        rt.finalize().unwrap();
+        assert_eq!(rt.stats().output_frames, rt.stats().input_frames);
+        let path = format!("{dir}/{prefix}_respeaker_bf.wav");
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        let samples: Vec<i16> = reader.samples::<i16>().map(Result::unwrap).collect();
+        assert_eq!(samples.len(), frames * 2);
+    }
+
+    #[test]
+    fn enable_drc_extends_wav_by_32_and_starts_near_zero() {
+        let (dir, prefix) = temp_dir_prefix("drc_on");
+        let mut cfg = fixed_das_config(0.0);
+        cfg.wav = true;
+        cfg.enable_drc = true;
+        cfg.output_gain_db = 15.0;
+        let frames = HOP_SIZE * 4;
+        let block: Vec<i16> = (0..frames)
+            .flat_map(|_| [2000i16, 2000, 2000, 2000])
+            .collect();
+        let mut rt = BeamformerRuntime::new(cfg, &dir, &prefix).unwrap();
+        rt.push_block(&block, None).unwrap();
+        rt.finalize().unwrap();
+        assert_eq!(rt.stats().output_frames, rt.stats().input_frames);
+        let path = format!("{dir}/{prefix}_respeaker_bf.wav");
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        let samples: Vec<i16> = reader.samples::<i16>().map(Result::unwrap).collect();
+        assert_eq!(samples.len(), frames + 32);
+        assert!(samples[..32].iter().all(|s| s.abs() <= 2));
+    }
+
+    #[test]
+    fn enable_drc_flush_keeps_delayed_tail() {
+        let (dir, prefix) = temp_dir_prefix("drc_tail");
+        let mut cfg = fixed_das_config(0.0);
+        cfg.wav = true;
+        cfg.enable_drc = true;
+        cfg.output_gain_db = 15.0;
+        let frames = HOP_SIZE * 4;
+        let block: Vec<i16> = (0..frames)
+            .flat_map(|_| [4000i16, 4000, 4000, 4000])
+            .collect();
+        let mut rt = BeamformerRuntime::new(cfg, &dir, &prefix).unwrap();
+        rt.push_block(&block, None).unwrap();
+        rt.finalize().unwrap();
+        let gained = rt.gained_bf().to_vec();
+        assert!(
+            gained[gained.len().saturating_sub(32)..]
+                .iter()
+                .any(|v| v.abs() > 1.0e-3)
+        );
+
+        let mut expected = gained;
+        expected.extend(std::iter::repeat_n(0.0, 32));
+        crate::drc::TssDrc::pipeline(SAMPLE_RATE)
+            .unwrap()
+            .process_in_place(&mut expected);
+
+        let path = format!("{dir}/{prefix}_respeaker_bf.wav");
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        let pcm: Vec<i16> = reader.samples::<i16>().map(Result::unwrap).collect();
+        assert_eq!(pcm.len(), expected.len());
+        assert!(pcm[pcm.len() - 32..].iter().any(|s| *s != 0));
+        for (i, (p, e)) in pcm.iter().zip(expected.iter()).enumerate() {
+            let recon = *p as f32 / 32768.0;
+            let err = (recon - *e).abs();
+            assert!(err <= 1.5 / 32768.0, "sample {i} err={err}");
+        }
+    }
+
+    #[test]
+    fn compare_wav_drc_matches_independent_instances() {
+        let (dir, prefix) = temp_dir_prefix("drc_cmp");
+        let mut cfg = fixed_das_config(0.0);
+        cfg.wav = true;
+        cfg.compare_wav = true;
+        cfg.enable_drc = true;
+        cfg.output_gain_db = 15.0;
+        let frames = HOP_SIZE * 4;
+        let mut block = Vec::with_capacity(frames * MIC_COUNT);
+        for n in 0..frames {
+            block.push(((n % 2000) + 500) as i16);
+            block.extend_from_slice(&[800, 800, 800]);
+        }
+        let mut rt = BeamformerRuntime::new(cfg, &dir, &prefix).unwrap();
+        rt.push_block(&block, None).unwrap();
+        rt.finalize().unwrap();
+
+        let mut exp_l = rt.gained_mic().to_vec();
+        exp_l.extend(std::iter::repeat_n(0.0, 32));
+        crate::drc::TssDrc::pipeline(SAMPLE_RATE)
+            .unwrap()
+            .process_in_place(&mut exp_l);
+        let mut exp_r = rt.gained_bf().to_vec();
+        exp_r.extend(std::iter::repeat_n(0.0, 32));
+        crate::drc::TssDrc::pipeline(SAMPLE_RATE)
+            .unwrap()
+            .process_in_place(&mut exp_r);
+
+        let path = format!("{dir}/{prefix}_respeaker_bf.wav");
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.spec().channels, 2);
+        let pcm: Vec<i16> = reader.samples::<i16>().map(Result::unwrap).collect();
+        assert_eq!(pcm.len(), exp_l.len() * 2);
+        assert!(
+            pcm[pcm.len() - 64..]
+                .chunks_exact(2)
+                .any(|p| p[0] != 0 && p[1] != 0)
+        );
+        for (i, pair) in pcm.chunks_exact(2).enumerate() {
+            let l = pair[0] as f32 / 32768.0;
+            let r = pair[1] as f32 / 32768.0;
+            assert!((l - exp_l[i]).abs() <= 1.5 / 32768.0, "L {i}");
+            assert!((r - exp_r[i]).abs() <= 1.5 / 32768.0, "R {i}");
+        }
+    }
+
+    #[test]
+    fn compare_wav_scratch_capacity_stays_fixed() {
+        let (dir, prefix) = temp_dir_prefix("drc_cap");
+        let mut cfg = fixed_das_config(0.0);
+        cfg.wav = true;
+        cfg.compare_wav = true;
+        cfg.enable_drc = true;
+        let mut rt = BeamformerRuntime::new(cfg, &dir, &prefix).unwrap();
+        let before = rt.scratch_capacities();
+        assert!(before.0 >= 2 * HOP_SIZE);
+        assert!(before.1 >= HOP_SIZE);
+        assert!(before.2 >= 2 * HOP_SIZE);
+        let frames = HOP_SIZE * 4;
+        let block: Vec<i16> = (0..frames)
+            .flat_map(|_| [1000i16, 1000, 1000, 1000])
+            .collect();
+        rt.push_block(&block, None).unwrap();
+        rt.finalize().unwrap();
+        assert_eq!(rt.scratch_capacities(), before);
     }
 }

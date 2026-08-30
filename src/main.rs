@@ -10,6 +10,7 @@ compile_error!("respeaker_algo 仅支持 Windows ReSpeaker WASAPI 独占录音")
 mod audio;
 mod beamformer;
 mod doa;
+mod drc;
 mod pipeline;
 mod pipeline_worker;
 mod recorder;

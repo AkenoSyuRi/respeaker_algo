@@ -28,3 +28,4 @@ sd_high_end_hz = 3500.0
 output_gain_db = 15.0
 wav = true
 compare_wav = true
+enable_drc = true
