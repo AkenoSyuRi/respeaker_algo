@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::thread;
 
 use wasapi::{
@@ -139,10 +139,22 @@ pub fn start_capture(
     let id = dev.id;
     let name = dev.name;
     let stop_thread = Arc::clone(&stop);
+    let (ready_tx, ready_rx) = sync_channel(1);
     let join = thread::Builder::new()
         .name("wasapi-capture".into())
-        .spawn(move || run_capture(&id, &name, rate, channels, tx, stop_thread))
+        .spawn(move || run_capture(&id, &name, rate, channels, tx, stop_thread, ready_tx))
         .map_err(|e| format!("创建采集线程失败: {e}"))?;
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = join.join();
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = join.join();
+            return Err("WASAPI 采集线程在 ready 前退出".into());
+        }
+    }
     Ok(WasapiSession {
         stop,
         join: Some(join),
@@ -156,6 +168,23 @@ fn run_capture(
     channels: u16,
     tx: SyncSender<CaptureBlock>,
     stop: Arc<AtomicBool>,
+    ready: SyncSender<Result<(), String>>,
+) -> Result<(), String> {
+    let result = run_capture_inner(id, name, rate, channels, tx, stop, ready.clone());
+    if let Err(error) = &result {
+        let _ = ready.send(Err(error.clone()));
+    }
+    result
+}
+
+fn run_capture_inner(
+    id: &str,
+    name: &str,
+    rate: u32,
+    channels: u16,
+    tx: SyncSender<CaptureBlock>,
+    stop: Arc<AtomicBool>,
+    ready: SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
     init_com()?;
 
@@ -231,6 +260,7 @@ fn run_capture(
     audio_client
         .start_stream()
         .map_err(|e| format!("启动音频流失败: {e}"))?;
+    let _ = ready.send(Ok(()));
     println!("WASAPI 独占采集已启动: {name}（{rate}Hz/{channels}ch，buffer={buffer_frames} 帧）");
 
     let frame_bytes = channels as usize * 2;

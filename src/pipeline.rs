@@ -3,14 +3,15 @@
 use std::fs;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::beamformer::{
     BeamformerAlgorithm, BeamformerConfig, BeamformerDirectionSource, BeamformerRuntime,
+    BeamformerStats,
 };
 use crate::doa::output::DoaRuntime;
 use crate::doa::{DoaConfig, DoaResult};
-use crate::web::{WebBroadcaster, WebServerHandle};
+use crate::events::EventPublisher;
 
 const PIPELINE_CONFIG_VERSION: u32 = 1;
 
@@ -98,17 +99,31 @@ fn default_enable_drc() -> bool {
     true
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
-    version: u32,
+    #[serde(default = "default_pipeline_version")]
+    pub version: u32,
     #[serde(default)]
-    modules: Vec<ModuleConfig>,
+    pub modules: Vec<ModuleConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+fn default_pipeline_version() -> u32 {
+    PIPELINE_CONFIG_VERSION
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            version: PIPELINE_CONFIG_VERSION,
+            modules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum ModuleConfig {
+pub enum ModuleConfig {
     Doa {
         #[serde(default = "default_enabled")]
         enabled: bool,
@@ -166,6 +181,7 @@ enum ModuleConfig {
 }
 
 impl PipelineConfig {
+    #[allow(dead_code)]
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = fs::read_to_string(path)
             .map_err(|e| format!("读取 Pipeline 配置 {} 失败: {e}", path.display()))?;
@@ -178,7 +194,11 @@ impl PipelineConfig {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub fn parse_toml(text: &str) -> Result<Self, String> {
+        Self::parse(text)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
         if self.version != PIPELINE_CONFIG_VERSION {
             return Err(format!(
                 "不支持的 Pipeline 配置版本 {}，当前仅支持 {}",
@@ -327,20 +347,28 @@ enum PipelineModuleRuntime {
 pub struct PipelineRuntime {
     modules: Vec<PipelineModuleRuntime>,
     state: PipelineState,
-    web_server: Option<WebServerHandle>,
-    web_broadcaster: Option<WebBroadcaster>,
+    event_publisher: Option<EventPublisher>,
     doa_sequence: u64,
 }
 
 impl PipelineRuntime {
+    #[allow(dead_code)]
     pub fn new(config: PipelineConfig, out_dir: &str, prefix: &str) -> Result<Self, String> {
+        Self::new_with_publisher(config, out_dir, prefix, None)
+    }
+
+    pub fn new_with_publisher(
+        config: PipelineConfig,
+        out_dir: &str,
+        prefix: &str,
+        event_publisher: Option<EventPublisher>,
+    ) -> Result<Self, String> {
         let mut modules = Vec::new();
-        let mut doa_enable_viewer = None;
         for module in config.modules {
             match module {
                 ModuleConfig::Doa {
                     enabled,
-                    enable_viewer,
+                    enable_viewer: _,
                     csv,
                     beta,
                     cpsd_tau_ms,
@@ -353,7 +381,6 @@ impl PipelineRuntime {
                     if !enabled {
                         continue;
                     }
-                    doa_enable_viewer = Some(enable_viewer);
                     let csv_path = csv.then(|| format!("{out_dir}/{prefix}_respeaker_doa.csv"));
                     modules.push(PipelineModuleRuntime::Doa(DoaRuntime::new(
                         DoaConfig {
@@ -413,17 +440,10 @@ impl PipelineRuntime {
                 }
             }
         }
-        let (web_server, web_broadcaster) = if doa_enable_viewer == Some(true) {
-            let (server, broadcaster) = WebServerHandle::start()?;
-            (Some(server), Some(broadcaster))
-        } else {
-            (None, None)
-        };
         Ok(Self {
             modules,
             state: PipelineState::default(),
-            web_server,
-            web_broadcaster,
+            event_publisher,
             doa_sequence: 0,
         })
     }
@@ -431,20 +451,24 @@ impl PipelineRuntime {
     pub fn push_block(&mut self, input: PipelineInputBlock<'_>) -> Result<(), String> {
         input.validate()?;
         let _raw_recording_views = (input.algo, input.reference, input.start_frame);
-        let web_broadcaster = self.web_broadcaster.clone();
+        let publisher = self.event_publisher.clone();
         for module in &mut self.modules {
             match module {
                 PipelineModuleRuntime::Doa(runtime) => {
                     for result in runtime.push_block(input.mic)? {
                         self.state.latest_doa = Some(result.clone());
                         self.doa_sequence += 1;
-                        if let Some(broadcaster) = &web_broadcaster {
-                            broadcaster.publish(self.doa_sequence, result)?;
+                        if let Some(p) = &publisher {
+                            let _ = p.publish_doa(self.doa_sequence, result);
                         }
                     }
                 }
                 PipelineModuleRuntime::Beamformer(runtime) => {
                     runtime.push_block(input.mic, self.state.latest_doa.as_ref())?;
+                    if let Some(p) = &publisher {
+                        let s = runtime.stats();
+                        p.publish_bf_stats(s);
+                    }
                 }
             }
         }
@@ -477,15 +501,17 @@ impl PipelineRuntime {
                 first_err.get_or_insert(e);
             }
         }
-        if let Some(server) = &mut self.web_server
-            && let Err(e) = server.shutdown()
-        {
-            first_err.get_or_insert(e);
-        }
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    pub fn beamformer_stats(&self) -> Option<BeamformerStats> {
+        self.modules.iter().find_map(|module| match module {
+            PipelineModuleRuntime::Beamformer(runtime) => Some(runtime.stats().clone()),
+            PipelineModuleRuntime::Doa(_) => None,
+        })
     }
 }
 
@@ -620,7 +646,6 @@ enable_drc = true
         else {
             panic!("expected beamformer");
         };
-        // 校验必须按用户配置的 algorithm / wav / compare_wav 原值构造，而非写死默认值。
         assert_eq!(*algorithm, BeamformerAlgorithm::RobustSuperdirective);
         assert!(!wav);
         assert!(*compare_wav);
@@ -718,37 +743,22 @@ enable_viewer = false
     }
 
     #[test]
-    fn web_viewer_follows_enabled_doa_module() {
-        let enabled = PipelineConfig::parse(
+    fn pipeline_with_publisher_still_works() {
+        let config = PipelineConfig::parse(
             r#"
 version = 1
 [[modules]]
 type = "doa"
+enable_viewer = false
 "#,
         )
         .unwrap();
-        let disabled = PipelineConfig::parse(
-            r#"
-version = 1
-[[modules]]
-type = "doa"
-enabled = false
-"#,
-        )
-        .unwrap();
-
-        let mut enabled_runtime =
-            PipelineRuntime::new(enabled, "target/out", "web_enabled").unwrap();
-        let mut disabled_runtime =
-            PipelineRuntime::new(disabled, "target/out", "web_disabled").unwrap();
-        assert!(enabled_runtime.web_server.is_some());
-        assert!(disabled_runtime.web_server.is_none());
-        enabled_runtime.finalize().unwrap();
-        disabled_runtime.finalize().unwrap();
+        let mut runtime = PipelineRuntime::new(config, "target/out", "pub_test").unwrap();
+        runtime.finalize().unwrap();
     }
 
     #[test]
-    fn enable_viewer_false_disables_viewer_service() {
+    fn enable_viewer_field_remains_backward_compatible() {
         let config = PipelineConfig::parse(
             r#"
 version = 1
@@ -770,8 +780,6 @@ enable_viewer = false
         assert!(!*enable_viewer);
 
         let mut runtime = PipelineRuntime::new(config, "target/out", "browser_disabled").unwrap();
-        assert!(runtime.web_server.is_none());
-        assert!(runtime.web_broadcaster.is_none());
         runtime.finalize().unwrap();
     }
 }

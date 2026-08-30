@@ -4,7 +4,7 @@ pub mod matrix;
 pub mod stft;
 pub mod weights;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::beamformer::stft::BeamformerStft;
 use crate::beamformer::weights::WeightLut;
@@ -13,14 +13,14 @@ use crate::doa::{DoaResult, HOP_SIZE, MIC_COUNT, SAMPLE_RATE, circular_delta_deg
 use crate::drc::TssDrc;
 use crate::wav::WavSink;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BeamformerAlgorithm {
     DelaySum,
     RobustSuperdirective,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BeamformerDirectionSource {
     Doa,
@@ -123,7 +123,7 @@ impl BeamformerConfig {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct BeamformerStats {
     pub input_frames: u64,
     pub output_frames: u64,

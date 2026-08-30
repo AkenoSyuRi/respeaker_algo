@@ -6,17 +6,19 @@ use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use crate::audio::{CaptureBlock, RESPEAKER_CHANNELS, RESPEAKER_MIC_CHANNELS};
+use crate::beamformer::BeamformerStats;
 use crate::doa::HOP_SIZE;
 use crate::pipeline::{PipelineConfig, PipelineInputBlock, PipelineRuntime};
 
 const PIPELINE_QUEUE_CAPACITY: usize = 32;
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PipelineWorkerStats {
     pub capture_blocks: u64,
     pub input_frames: u64,
     pub processed_hops: u64,
     pub max_queue_depth: usize,
+    pub bf_stats: Option<BeamformerStats>,
 }
 
 pub struct PipelineWorkerHandle {
@@ -28,7 +30,17 @@ pub struct PipelineWorkerHandle {
 }
 
 impl PipelineWorkerHandle {
+    #[allow(dead_code)]
     pub fn spawn(config: PipelineConfig, out_dir: String, prefix: String) -> Result<Self, String> {
+        Self::spawn_with_publisher(config, out_dir, prefix, None)
+    }
+
+    pub fn spawn_with_publisher(
+        config: PipelineConfig,
+        out_dir: String,
+        prefix: String,
+        publisher: Option<crate::events::EventPublisher>,
+    ) -> Result<Self, String> {
         let (tx, rx) = sync_channel::<CaptureBlock>(PIPELINE_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = sync_channel::<Result<(), String>>(1);
         let queue_depth = Arc::new(AtomicUsize::new(0));
@@ -41,16 +53,18 @@ impl PipelineWorkerHandle {
         let join = thread::Builder::new()
             .name("algorithm-worker".into())
             .spawn(move || {
-                let runtime = match PipelineRuntime::new(config, &out_dir, &prefix) {
-                    Ok(r) => {
-                        let _ = ready_tx.send(Ok(()));
-                        r
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e.clone()));
-                        return Err(e);
-                    }
-                };
+                let runtime =
+                    match PipelineRuntime::new_with_publisher(config, &out_dir, &prefix, publisher)
+                    {
+                        Ok(r) => {
+                            let _ = ready_tx.send(Ok(()));
+                            r
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e.clone()));
+                            return Err(e);
+                        }
+                    };
                 run_worker(rx, runtime, depth_worker, max_worker, error_worker)
             })
             .map_err(|e| format!("创建 algorithm worker 失败: {e}"))?;
@@ -287,7 +301,9 @@ fn run_worker(
         let _ = worker_error.set(e.clone());
         first_err = Some(e);
     }
-    if let Err(e) = runtime.finalize() {
+    let finalize_result = runtime.finalize();
+    stats.bf_stats = runtime.beamformer_stats();
+    if let Err(e) = finalize_result {
         let _ = worker_error.set(e.clone());
         first_err.get_or_insert(e);
     }
@@ -431,6 +447,28 @@ enable_viewer = false
     }
 
     #[test]
+    fn worker_returns_beamformer_stats() {
+        let config = PipelineConfig::parse(
+            r#"
+version = 1
+[[modules]]
+type = "beamformer"
+direction_source = "fixed"
+wav = false
+"#,
+        )
+        .unwrap();
+        let mut worker =
+            PipelineWorkerHandle::spawn(config, "target/out".into(), "bf_stats_manifest".into())
+                .unwrap();
+        worker.try_push(silent_block(0, 0, HOP_SIZE)).unwrap();
+        worker.close_input();
+        let stats = worker.finish().unwrap();
+        let bf_stats = stats.bf_stats.unwrap();
+        assert_eq!(bf_stats.input_frames, HOP_SIZE as u64);
+    }
+
+    #[test]
     fn pipeline_try_push_reports_full() {
         let (tx, _rx) = sync_channel::<CaptureBlock>(1);
         let queue_depth = Arc::new(AtomicUsize::new(0));
@@ -532,8 +570,7 @@ enable_viewer = false
 
     #[test]
     fn worker_init_error_is_returned_before_spawn_success() {
-        // 非法配置在 load/parse 阶段就会失败；这里用端口占用较难稳定构造。
-        // Viewer 默认端口在并行测试中可能冲突，改用固定失败：空 out 路径非法字符。
+        // 用固定的非法输出路径构造稳定的 worker 初始化失败。
         let config = PipelineConfig::parse(
             r#"
 version = 1

@@ -1,28 +1,46 @@
 //! Windows ReSpeaker 录音核心：WASAPI 独占采集 → 六通道拆分 → WAV 与可选算法 worker。
 
-use std::path::PathBuf;
+use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
 use std::time::{Duration, Instant};
 
+use crate::app_config::RecordingConfig;
 use crate::audio::{
     CAPTURE_QUEUE_CAPACITY, CaptureBlock, RESPEAKER_CHANNELS, RESPEAKER_SAMPLE_RATE,
 };
+use crate::beamformer::BeamformerStats;
+use crate::events::{ErrorSource, EventPublisher, ServiceError};
 use crate::pipeline::PipelineConfig;
 use crate::pipeline_worker::{PipelineWorkerHandle, PipelineWorkerStats};
+use crate::recordings::{SessionManifest, SessionResultStatus, check_no_clobber};
 use crate::wav::WavSink;
 
-/// 录音参数（来自 CLI）。采样率、通道数和 WASAPI 后端固定为 ReSpeaker 所需值。
-pub struct RecordOptions {
-    /// 录制时长（秒），0 = 持续录制直到 Ctrl+C。
-    pub duration: u64,
-    /// 输出目录（默认 `target/out`）。
+pub struct RecordingRequest {
+    pub recording: RecordingConfig,
+    pub pipeline: Option<PipelineConfig>,
+    pub session_id: String,
+}
+
+pub type RecordingReadyCallback = Box<dyn FnOnce(Result<(), String>) + Send>;
+pub type RecordingStoppingCallback = Box<dyn FnOnce() + Send>;
+
+pub struct RecordingControl {
+    pub stop: Arc<AtomicBool>,
+    pub events: EventPublisher,
+    pub ready: Option<RecordingReadyCallback>,
+    pub stopping: Option<RecordingStoppingCallback>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecordingSummary {
+    pub session_id: String,
+    pub prefix: String,
     pub out_dir: String,
-    /// 输出文件前缀（默认当前时间戳，如 `20260809_143012`）。
-    pub prefix: Option<String>,
-    /// 可选的内置算法 Pipeline TOML。
-    pub pipeline_config: Option<PathBuf>,
+    pub captured_frames: u64,
+    pub pipeline_stats: Option<PipelineWorkerStats>,
+    pub bf_stats: Option<BeamformerStats>,
 }
 
 enum PipelineDispatchState {
@@ -54,112 +72,319 @@ pub fn default_prefix() -> String {
     chrono::Local::now().format("%Y%m%d_%H%M%S").to_string()
 }
 
-/// 执行一次固定 16 kHz / 16-bit / 6 通道 ReSpeaker 录音。
-pub fn run_record(opts: &RecordOptions) -> Result<(), String> {
-    let pipeline_config = opts
-        .pipeline_config
-        .as_deref()
-        .map(PipelineConfig::load)
-        .transpose()?;
+/// 执行一次录音。该函数不注册 Ctrl+C，所有生命周期由 Controller 管理。
+pub fn run_recording(
+    request: RecordingRequest,
+    mut control: RecordingControl,
+) -> Result<RecordingSummary, String> {
+    request.recording.validate()?;
+    if let Some(config) = &request.pipeline {
+        config.validate()?;
+    }
+    crate::recordings::validate_session_id(&request.session_id)?;
+    let prefix = request
+        .recording
+        .prefix
+        .clone()
+        .unwrap_or_else(default_prefix);
+    crate::app_config::validate_prefix(&prefix)?;
+    let out_dir = request.recording.out_dir.clone();
+    let app_config = crate::app_config::AppConfig {
+        recording: request.recording.clone(),
+        pipeline_enabled: request.pipeline.is_some(),
+        pipeline: request.pipeline.clone().unwrap_or_default(),
+        ..crate::app_config::AppConfig::default()
+    };
+    check_no_clobber(&out_dir, &prefix, &app_config)?;
+    fs::create_dir_all(&out_dir).map_err(|e| format!("创建输出目录 {out_dir} 失败: {e}"))?;
 
-    let prefix = opts.prefix.clone().unwrap_or_else(default_prefix);
-    let out_dir = &opts.out_dir;
-    std::fs::create_dir_all(out_dir).map_err(|e| format!("创建输出目录 {out_dir} 失败: {e}"))?;
+    let started_at = chrono::Local::now().to_rfc3339();
+    let mut manifest = SessionManifest::new(
+        request.session_id.clone(),
+        prefix.clone(),
+        started_at,
+        app_config,
+    );
+    manifest.save_atomic(&out_dir)?;
+
     let algo_path = format!("{out_dir}/{prefix}_respeaker_algo.wav");
     let mic_path = format!("{out_dir}/{prefix}_respeaker_mic.wav");
-    let ref_path = format!("{out_dir}/{prefix}_respeaker_ref.wav");
-
-    let mut pipeline = match pipeline_config {
-        Some(config) => PipelineDispatchState::Active(PipelineWorkerHandle::spawn(
-            config,
-            out_dir.to_string(),
-            prefix.clone(),
-        )?),
-        None => PipelineDispatchState::Disabled,
-    };
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_handler = Arc::clone(&stop);
-    ctrlc::set_handler(move || {
-        eprintln!("\n收到 Ctrl+C，正在停止录制…");
-        stop_handler.store(true, Ordering::SeqCst);
-    })
-    .map_err(|e| format!("注册 Ctrl+C 处理器失败: {e}"))?;
-
-    let (tx, rx) = sync_channel(CAPTURE_QUEUE_CAPACITY);
-    let device = crate::wasapi::pick_respeaker_input_device()?;
-    println!("输入设备: {}", device.name);
-    let raw_writers = create_raw_wav_writers(&SplitOutputs {
+    let reference_path = format!("{out_dir}/{prefix}_respeaker_ref.wav");
+    let outputs = SplitOutputs {
         algo: &algo_path,
         mic: &mic_path,
-        reference: &ref_path,
-    })?;
+        reference: &reference_path,
+    };
+    // 先确认设备，再创建输出；失败时只更新 starting manifest，不遗留半成品 WAV。
+    let device = match crate::wasapi::pick_respeaker_input_device() {
+        Ok(device) => device,
+        Err(error) => {
+            return startup_failure(manifest, &out_dir, control, ErrorSource::Device, error);
+        }
+    };
+    let raw_writers = match create_raw_wav_writers(&outputs) {
+        Ok(writers) => writers,
+        Err(error) => {
+            return startup_failure(manifest, &out_dir, control, ErrorSource::RawWav, error);
+        }
+    };
+    let mut pipeline = match request.pipeline {
+        Some(config) => match PipelineWorkerHandle::spawn_with_publisher(
+            config,
+            out_dir.clone(),
+            prefix.clone(),
+            Some(control.events.clone()),
+        ) {
+            Ok(worker) => PipelineDispatchState::Active(worker),
+            Err(error) => {
+                let mut first_error = Some(error.clone());
+                finalize_raw_wav_writers(raw_writers, &outputs, &mut first_error);
+                return startup_failure(manifest, &out_dir, control, ErrorSource::Pipeline, error);
+            }
+        },
+        None => PipelineDispatchState::Disabled,
+    };
+    let (tx, rx) = sync_channel(CAPTURE_QUEUE_CAPACITY);
     let mut session = match crate::wasapi::start_capture(
         device,
         RESPEAKER_SAMPLE_RATE,
         RESPEAKER_CHANNELS as u16,
         tx.clone(),
-        Arc::clone(&stop),
+        control.stop.clone(),
     ) {
         Ok(session) => session,
         Err(error) => {
-            let mut first_error = Some(error);
-            finalize_raw_wav_writers(
-                raw_writers,
-                &SplitOutputs {
-                    algo: &algo_path,
-                    mic: &mic_path,
-                    reference: &ref_path,
-                },
-                &mut first_error,
-            );
-            finish_pipeline(&mut pipeline, &mut first_error);
-            return Err(first_error.expect("WASAPI 启动错误必须保留"));
+            let mut first_error = Some(error.clone());
+            finalize_raw_wav_writers(raw_writers, &outputs, &mut first_error);
+            finish_pipeline(&mut pipeline, &mut first_error, &control.events);
+            return startup_failure(manifest, &out_dir, control, ErrorSource::Capture, error);
         }
     };
     drop(tx);
-
-    println!("输出目录: {out_dir}（前缀 {prefix}）");
-    if opts.pipeline_config.is_some() {
-        println!("内置算法 Pipeline 已启用（独立 algorithm worker）");
+    manifest.status = SessionResultStatus::Recording;
+    manifest.refresh_files(&out_dir);
+    if let Err(error) = manifest.save_atomic(&out_dir) {
+        let message = format!("保存 recording manifest 失败: {error}");
+        control.stop.store(true, Ordering::SeqCst);
+        let mut first_error = Some(message.clone());
+        append_err(&mut first_error, session.stop_and_join());
+        finalize_raw_wav_writers(raw_writers, &outputs, &mut first_error);
+        finish_pipeline(&mut pipeline, &mut first_error, &control.events);
+        return startup_failure(
+            manifest,
+            &out_dir,
+            control,
+            ErrorSource::RawWav,
+            first_error.unwrap_or(message),
+        );
     }
-    println!(
-        "开始录制 ->\n  {algo_path}  (ch0 算法输出)\n  {mic_path}  (ch1-4 麦克风原始)\n  {ref_path}  (ch5 回放)\nCtrl+C 或 {} 秒后停止",
-        if opts.duration > 0 {
-            opts.duration.to_string()
-        } else {
-            "不限时".to_string()
-        }
-    );
+    if let Some(ready) = control.ready.take() {
+        ready(Ok(()));
+    }
 
-    let deadline = (opts.duration > 0).then(|| Instant::now() + Duration::from_secs(opts.duration));
     let started = Instant::now();
-    let result = write_split_loop(
-        &SplitOutputs {
-            algo: &algo_path,
-            mic: &mic_path,
-            reference: &ref_path,
-        },
+    let deadline = (request.recording.duration_seconds > 0)
+        .then(|| started + Duration::from_secs(request.recording.duration_seconds));
+    let loop_result = write_split_loop_with_events(
+        &outputs,
         &rx,
-        &stop,
+        &control.stop,
         deadline,
         raw_writers,
         &mut pipeline,
         &mut session,
+        &control.events,
+        control.stopping.take(),
+        started,
     );
-
-    let size = |p: &str| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    if let Ok(frames) = &result {
-        println!(
-            "录制完成: 约 {:.1}s / {} 帧\n  algo: {:.2} MB\n  mic:  {:.2} MB\n  ref:  {:.2} MB",
-            started.elapsed().as_secs_f32(),
-            frames,
-            size(&algo_path) as f64 / 1e6,
-            size(&mic_path) as f64 / 1e6,
-            size(&ref_path) as f64 / 1e6,
-        );
+    manifest.captured_frames = loop_result.captured_frames;
+    manifest.pipeline_stats = loop_result.pipeline_stats;
+    manifest.bf_stats = manifest
+        .pipeline_stats
+        .as_ref()
+        .and_then(|stats| stats.bf_stats.clone());
+    manifest.status = if loop_result.error.is_some() {
+        SessionResultStatus::Failed
+    } else {
+        SessionResultStatus::Success
+    };
+    manifest.error = loop_result.error.as_ref().map(|error| {
+        ServiceError::new(loop_result.error_source, "recording_failed", error.clone())
+    });
+    manifest.finished_at = Some(chrono::Local::now().to_rfc3339());
+    manifest.refresh_files(&out_dir);
+    let manifest_error = manifest.save_atomic(&out_dir).err();
+    if let Some(error) = manifest_error
+        && loop_result.error.is_none()
+    {
+        return Err(error);
     }
-    result.map(|_| ())
+    if let Some(error) = loop_result.error {
+        return Err(error);
+    }
+    Ok(RecordingSummary {
+        session_id: request.session_id,
+        prefix,
+        out_dir,
+        captured_frames: manifest.captured_frames,
+        pipeline_stats: manifest.pipeline_stats,
+        bf_stats: manifest.bf_stats,
+    })
+}
+
+fn startup_failure<T>(
+    mut manifest: SessionManifest,
+    out_dir: &str,
+    mut control: RecordingControl,
+    source: ErrorSource,
+    error: String,
+) -> Result<T, String> {
+    if let Some(ready) = control.ready.take() {
+        ready(Err(error.clone()));
+    }
+    manifest.status = SessionResultStatus::Failed;
+    manifest.error = Some(ServiceError::new(source, "startup_failed", error.clone()));
+    manifest.finished_at = Some(chrono::Local::now().to_rfc3339());
+    manifest.refresh_files(out_dir);
+    let _ = manifest.save_atomic(out_dir);
+    control
+        .events
+        .publish_error(ServiceError::new(source, "startup_failed", error.clone()));
+    Err(error)
+}
+
+struct LoopResult {
+    captured_frames: u64,
+    pipeline_stats: Option<PipelineWorkerStats>,
+    error: Option<String>,
+    error_source: ErrorSource,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_split_loop_with_events(
+    out: &SplitOutputs<'_>,
+    rx: &Receiver<CaptureBlock>,
+    stop: &AtomicBool,
+    deadline: Option<Instant>,
+    mut raw_writers: RawWavWriters,
+    pipeline: &mut PipelineDispatchState,
+    session: &mut crate::wasapi::WasapiSession,
+    publisher: &EventPublisher,
+    mut stopping: Option<Box<dyn FnOnce() + Send>>,
+    started: Instant,
+) -> LoopResult {
+    let mut algo_buf = Vec::new();
+    let mut mic_buf = Vec::new();
+    let mut ref_buf = Vec::new();
+    let mut frames = 0u64;
+    let mut first_error: Option<String> = None;
+    let mut draining = false;
+    let mut last_progress = started;
+
+    loop {
+        if !draining {
+            if stop.load(Ordering::SeqCst) {
+                draining = true;
+            }
+            if let Some(dl) = deadline
+                && Instant::now() >= dl
+            {
+                stop.store(true, Ordering::SeqCst);
+                draining = true;
+                notify_stopping(&mut stopping);
+            }
+        }
+        if last_progress.elapsed() >= Duration::from_millis(200) {
+            publisher.publish_recording_progress(started.elapsed().as_secs_f64(), frames);
+            last_progress = Instant::now();
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(block) => {
+                let pipeline_was_active = matches!(pipeline, PipelineDispatchState::Active(_));
+                if process_received_block(
+                    &block,
+                    out,
+                    &mut raw_writers,
+                    &mut algo_buf,
+                    &mut mic_buf,
+                    &mut ref_buf,
+                    pipeline,
+                    &mut first_error,
+                    stop,
+                    &mut draining,
+                ) {
+                    frames += block.frames as u64;
+                } else {
+                    notify_stopping(&mut stopping);
+                }
+                if pipeline_was_active
+                    && let PipelineDispatchState::Failed { first_error: e, .. } = pipeline
+                {
+                    publisher.publish_error(ServiceError::new(
+                        ErrorSource::Pipeline,
+                        "pipeline_degraded",
+                        e.clone(),
+                    ));
+                    publisher.publish_pipeline_status(crate::events::PipelineSnapshot {
+                        enabled: true,
+                        degraded: true,
+                        error: Some(e.clone()),
+                        ..crate::events::PipelineSnapshot::default()
+                    });
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if draining && stop.load(Ordering::SeqCst) {
+                    continue;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                append_err(&mut first_error, session.stop_and_join());
+                if first_error.is_some() {
+                    notify_stopping(&mut stopping);
+                }
+                break;
+            }
+        }
+    }
+    finalize_raw_wav_writers(raw_writers, out, &mut first_error);
+    let pipeline_stats = finish_pipeline(pipeline, &mut first_error, publisher);
+    append_err(&mut first_error, session.stop_and_join());
+    if first_error.as_deref().is_some_and(|error| {
+        matches!(
+            classify_error(error),
+            ErrorSource::Capture | ErrorSource::RawWav
+        )
+    }) {
+        notify_stopping(&mut stopping);
+    }
+    let error_source = first_error
+        .as_deref()
+        .map(classify_error)
+        .unwrap_or(ErrorSource::Capture);
+    LoopResult {
+        captured_frames: frames,
+        pipeline_stats,
+        error: first_error,
+        error_source,
+    }
+}
+
+fn notify_stopping(stopping: &mut Option<Box<dyn FnOnce() + Send>>) {
+    if let Some(callback) = stopping.take() {
+        callback();
+    }
+}
+
+fn classify_error(error: &str) -> ErrorSource {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("pipeline") || lower.contains("algorithm worker") {
+        ErrorSource::Pipeline
+    } else if lower.contains("wav") || error.contains("写入") || error.contains("完成") {
+        ErrorSource::RawWav
+    } else {
+        ErrorSource::Capture
+    }
 }
 
 /// 把 6 通道交织样本拆分为 algo（ch0）、mic（ch1..ch4）和 reference（ch5）。
@@ -215,81 +440,6 @@ fn create_raw_wav_writers(out: &SplitOutputs<'_>) -> Result<RawWavWriters, Strin
         mic,
         reference,
     })
-}
-
-fn write_split_loop(
-    out: &SplitOutputs<'_>,
-    rx: &Receiver<CaptureBlock>,
-    stop: &AtomicBool,
-    deadline: Option<Instant>,
-    mut raw_writers: RawWavWriters,
-    pipeline: &mut PipelineDispatchState,
-    session: &mut crate::wasapi::WasapiSession,
-) -> Result<u64, String> {
-    let mut algo_buf = Vec::new();
-    let mut mic_buf = Vec::new();
-    let mut ref_buf = Vec::new();
-    let mut frames = 0u64;
-    let mut first_error: Option<String> = None;
-    let mut draining = false;
-
-    loop {
-        if !draining {
-            if stop.load(Ordering::SeqCst) {
-                draining = true;
-            }
-            if let Some(dl) = deadline
-                && Instant::now() >= dl
-            {
-                stop.store(true, Ordering::SeqCst);
-                draining = true;
-            }
-        }
-
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(block) => {
-                if process_received_block(
-                    &block,
-                    out,
-                    &mut raw_writers,
-                    &mut algo_buf,
-                    &mut mic_buf,
-                    &mut ref_buf,
-                    pipeline,
-                    &mut first_error,
-                    stop,
-                    &mut draining,
-                ) {
-                    frames += block.frames as u64;
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if draining && stop.load(Ordering::SeqCst) {
-                    // 仍可能有 in-flight 数据；继续直到 Disconnected。
-                    continue;
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    // 优先 finalize raw WAV。
-    finalize_raw_wav_writers(raw_writers, out, &mut first_error);
-
-    let pipeline_stats = finish_pipeline(pipeline, &mut first_error);
-    append_err(&mut first_error, session.stop_and_join());
-
-    if let Some(stats) = pipeline_stats {
-        println!(
-            "algorithm worker: blocks={} frames={} hops={} max_queue_depth={}",
-            stats.capture_blocks, stats.input_frames, stats.processed_hops, stats.max_queue_depth
-        );
-    }
-
-    match first_error {
-        Some(e) => Err(e),
-        None => Ok(frames),
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -403,6 +553,7 @@ fn process_capture_block(
 fn finish_pipeline(
     pipeline: &mut PipelineDispatchState,
     first_error: &mut Option<String>,
+    publisher: &EventPublisher,
 ) -> Option<PipelineWorkerStats> {
     let mut tmp = PipelineDispatchState::Disabled;
     std::mem::swap(pipeline, &mut tmp);
@@ -413,7 +564,12 @@ fn finish_pipeline(
             match worker.finish() {
                 Ok(stats) => Some(stats),
                 Err(e) => {
-                    first_error.get_or_insert(e);
+                    first_error.get_or_insert(e.clone());
+                    publisher.publish_error(ServiceError::new(
+                        ErrorSource::Pipeline,
+                        "pipeline_failed",
+                        e,
+                    ));
                     None
                 }
             }
@@ -422,14 +578,25 @@ fn finish_pipeline(
             mut worker,
             first_error: pipeline_err,
         } => {
-            // first_error 优先于 finish() == Ok。worker 内部错误已在 try_push
-            // 失败时记录过，finish() 若返回同一错误则不重复追加。
-            first_error.get_or_insert(pipeline_err);
+            // worker 错误只停用 Pipeline，不停止当前 capture；但保留首错供
+            // manifest 和 Controller 在 session finalize 后报告。
+            first_error.get_or_insert(pipeline_err.clone());
             match worker.finish() {
                 Ok(stats) => Some(stats),
                 Err(e) => {
-                    if first_error.as_deref() != Some(e.as_str()) {
-                        append_err(first_error, Err(e));
+                    if e != pipeline_err {
+                        first_error.get_or_insert(e.clone());
+                        publisher.publish_error(ServiceError::new(
+                            ErrorSource::Pipeline,
+                            "pipeline_failed",
+                            e,
+                        ));
+                        publisher.publish_pipeline_status(crate::events::PipelineSnapshot {
+                            enabled: true,
+                            degraded: true,
+                            error: Some(pipeline_err.clone()),
+                            ..crate::events::PipelineSnapshot::default()
+                        });
                     }
                     None
                 }
@@ -577,7 +744,11 @@ mod tests {
         );
         assert_eq!(read_wav_samples(&ref_path), vec![1, 2, 3]);
 
-        finish_pipeline(&mut pipeline, &mut first_error);
+        finish_pipeline(
+            &mut pipeline,
+            &mut first_error,
+            &crate::events::EventBus::new(1).publisher(),
+        );
         assert_eq!(first_error.as_deref(), Some("Pipeline queue overrun"));
     }
 
@@ -609,7 +780,11 @@ mod tests {
         assert_eq!(read_wav_samples(&algo_path), vec![1, 2]);
         assert!(first_error.is_none());
 
-        finish_pipeline(&mut pipeline, &mut first_error);
+        finish_pipeline(
+            &mut pipeline,
+            &mut first_error,
+            &crate::events::EventBus::new(1).publisher(),
+        );
         assert_eq!(first_error.as_deref(), Some("synthetic pipeline error"));
     }
 
@@ -651,10 +826,12 @@ enable_viewer = false
             first_error: pipeline_err.clone(),
         };
         let mut first_error = None;
-        finish_pipeline(&mut pipeline, &mut first_error);
-        let final_error = first_error.expect("worker 错误必须保留");
-        assert_eq!(final_error, pipeline_err);
-        assert!(!final_error.contains("; "), "错误不应重复: {final_error}");
+        finish_pipeline(
+            &mut pipeline,
+            &mut first_error,
+            &crate::events::EventBus::new(1).publisher(),
+        );
+        assert_eq!(first_error, Some(pipeline_err));
     }
 
     #[test]
@@ -699,7 +876,11 @@ enable_viewer = false
         assert!(!stop.load(Ordering::SeqCst));
         finalize_raw_wav_writers(raw, &out, &mut first_error);
         assert_eq!(read_wav_samples(&algo_path), vec![0, 1, 2]);
-        finish_pipeline(&mut pipeline, &mut first_error);
+        finish_pipeline(
+            &mut pipeline,
+            &mut first_error,
+            &crate::events::EventBus::new(1).publisher(),
+        );
         assert!(first_error.unwrap().contains("disconnected"));
     }
 

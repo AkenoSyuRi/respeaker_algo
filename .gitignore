@@ -1,2 +1,4 @@
 .zcode/
 /target
+/recordings/
+.mcp.json

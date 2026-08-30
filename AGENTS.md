@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is a Windows-only Rust 2024 CLI for ReSpeaker Mic Array v2.0 recording and built-in algorithm pipelines. `src/main.rs` defines the recording CLI. `src/recorder.rs` coordinates fixed 16 kHz/6ch WASAPI capture, channel splitting, and raw WAV output; `src/audio.rs` defines the `CaptureBlock` and the fixed 16 kHz/6ch device contract. `src/pipeline.rs` parses module configuration; `src/pipeline_worker.rs` runs the configured modules in a dedicated algorithm thread, assembles fixed 256-frame hops from capture blocks, and manages the bounded queue lifecycle (queue `Full` only disables the pipeline; raw recording continues). `src/beamformer/` implements Delay-and-Sum / robust superdirective MVDR weights and the streaming WOLA STFT; it consumes the DOA internal angle, while the viewer only publishes the external angle, and after output gain optionally applies DRC; `compare_wav = true` writes `*_respeaker_bf.wav` as a stereo comparison (left and right both get gain, then optional DRC). `src/web.rs` serves the embedded DOA SSE viewer from `web/`; `src/wasapi.rs` owns exclusive capture; `src/wav.rs` writes PCM WAV files.
+This is a Windows-only Rust 2024 local Web service for ReSpeaker Mic Array v2.0 recording and built-in algorithm pipelines. `src/main.rs` starts the resident loopback Web service; `src/controller.rs` owns service state and recording sessions. `src/recorder.rs` coordinates fixed 16 kHz/6ch WASAPI capture, channel splitting, raw WAV output, manifests, and external stop; `src/audio.rs` defines the `CaptureBlock` and fixed device contract. `src/pipeline.rs` parses module configuration; `src/pipeline_worker.rs` runs configured modules in a dedicated algorithm thread, assembles fixed 256-frame hops, and manages bounded queue lifecycle (queue `Full` only disables the pipeline; raw recording continues, while the pipeline error is retained for session reporting). `src/beamformer/` implements Delay-and-Sum / robust superdirective MVDR weights and streaming WOLA STFT; it consumes the DOA internal angle, while Web/CSV publish the external angle, and after output gain optionally applies DRC; `compare_wav = true` writes `*_respeaker_bf.wav` as a stereo comparison (left and right both get gain, then optional DRC). `src/web.rs` serves the embedded local management UI, REST API, and SSE; `src/events.rs` provides the EventBus; `src/wasapi.rs` owns exclusive capture; `src/wav.rs` writes PCM WAV files.
 
 DOA code lives under `src/doa/`: framing, geometry, SRP-PHAT processing, tracking, and runtime output are separated by module. Unit tests are colocated in `#[cfg(test)]` modules. Design requirements are documented in `docs/plans/`. Generated recordings and build artifacts belong under `target/` and must not be committed.
 
@@ -11,13 +11,11 @@ DOA code lives under `src/doa/`: framing, geometry, SRP-PHAT processing, trackin
 - `cargo fmt --all -- --check` verifies Rust formatting.
 - `cargo clippy --all-targets --all-features -- -D warnings` rejects lint warnings.
 - `cargo test --all-targets` runs deterministic tests without requiring an audio device.
-- `cargo build --release` builds the optimized CLI.
-- `cargo run -- --duration 10` performs a pure-recording Windows hardware smoke test.
-- `cargo run -- --duration 10 --pipeline-config configs/doa.toml` records while running DOA and its local Web Viewer.
-- `cargo run --release -- --duration 10 --pipeline-config configs/bf_fixed.toml` records while running the fixed-direction beamformer.
-- `cargo run --release -- --duration 10 --pipeline-config configs/doa_bf.toml` records while running DOA steering the beamformer.
+- `cargo build --release` builds the optimized local Web service.
+- `cargo run --release` starts the service at `http://127.0.0.1:8765`; recording is started from the Web UI.
 
-Run the full four-command validation sequence before submitting changes.
+Run the full four-command validation sequence before submitting changes. Hardware smoke tests use the
+Web UI and are reported separately from sound-card-independent automated tests.
 
 ## Coding Style & Naming Conventions
 

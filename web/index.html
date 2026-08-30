@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ReSpeaker Audio Manager</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">RESPEAKER / LOCAL CONTROL</p>
+        <h1>Audio Manager</h1>
+        <p class="lede">让每一次阵列录音都有清晰的配置、状态和归档。</p>
+      </div>
+      <div class="connection-pill"><span id="connection-dot"></span><span id="connection-text">连接中</span></div>
+    </header>
+
+    <section class="status-grid" aria-label="运行状态">
+      <article class="status-card status-main">
+        <div class="card-label">SESSION STATE</div>
+        <div id="phase" class="phase">Idle</div>
+        <div id="session-detail" class="muted">等待开始录音</div>
+        <div class="actions">
+          <button id="start-button" class="button button-primary">开始录音</button>
+          <button id="stop-button" class="button button-quiet" disabled>停止录音</button>
+        </div>
+      </article>
+      <article class="status-card">
+        <div class="card-label">DEVICE</div>
+        <div id="device-name" class="metric">检测中</div>
+        <div id="device-detail" class="muted">WASAPI 独占 / 16 kHz / 6 ch</div>
+      </article>
+      <article class="status-card">
+        <div class="card-label">CAPTURED FRAMES</div>
+        <div id="frame-count" class="metric">0</div>
+        <div id="duration" class="muted">0.0 s</div>
+      </article>
+    </section>
+
+    <section class="workspace">
+      <article class="panel config-panel">
+        <div class="panel-heading">
+          <div>
+            <div class="card-label">DRAFT CONFIG</div>
+            <h2>录音与 Pipeline</h2>
+          </div>
+          <span id="config-warning" class="warning"></span>
+        </div>
+        <p class="panel-copy">编辑当前 draft。录音开始后会冻结 active snapshot，下一次 session 才会使用新配置。</p>
+        <div class="config-fields">
+          <label>录音时长（秒，0 = 手动停止）<input id="duration-seconds" type="number" min="0" step="1"></label>
+          <label>输出目录<input id="out-dir" type="text" spellcheck="false"></label>
+          <label>文件前缀（留空自动生成）<input id="recording-prefix" type="text" spellcheck="false"></label>
+          <label class="check-label"><input id="pipeline-enabled" type="checkbox"> 启用算法 Pipeline</label>
+          <section class="module-config">
+            <h3>DOA</h3>
+            <div class="module-fields">
+              <label class="check-label"><input id="doa-enabled" type="checkbox"> 启用</label>
+              <label class="check-label"><input id="doa-csv" type="checkbox"> 写入 CSV</label>
+              <label>角度 offset<input id="doa-angle-offset" type="number" step="0.1"></label>
+              <label class="check-label"><input id="doa-clockwise" type="checkbox"> 顺时针角度</label>
+              <label>Acquire confidence<input id="doa-acquire-confidence" type="number" min="0" max="1" step="0.01"></label>
+              <label>Update confidence<input id="doa-update-confidence" type="number" min="0" max="1" step="0.01"></label>
+            </div>
+          </section>
+          <section class="module-config">
+            <h3>Beamformer / DRC</h3>
+            <div class="module-fields">
+              <label class="check-label"><input id="bf-enabled" type="checkbox"> 启用 BF</label>
+              <label>算法<select id="bf-algorithm"><option value="robust_superdirective">Robust Superdirective</option><option value="delay_sum">Delay-and-Sum</option></select></label>
+              <label>方向来源<select id="bf-direction-source"><option value="doa">DOA</option><option value="fixed">固定角度</option></select></label>
+              <label>Fixed angle<input id="bf-fixed-angle" type="number" step="0.1"></label>
+              <label>Fallback angle<input id="bf-fallback-angle" type="number" step="0.1"></label>
+              <label>方向平滑（毫秒）<input id="bf-smoothing" type="number" min="0" step="1"></label>
+              <label>输出增益（dB）<input id="bf-output-gain" type="number" step="0.1"></label>
+              <label class="check-label"><input id="bf-wav" type="checkbox"> 写入 BF WAV</label>
+              <label class="check-label"><input id="bf-compare-wav" type="checkbox"> Compare WAV</label>
+              <label class="check-label"><input id="bf-enable-drc" type="checkbox"> 启用 DRC</label>
+            </div>
+          </section>
+        </div>
+        <details class="advanced-config">
+          <summary>高级设置 / AppConfig JSON</summary>
+          <textarea id="config-editor" spellcheck="false" aria-label="AppConfig JSON"></textarea>
+        </details>
+        <div class="toolbar">
+          <button id="apply-button" class="button button-primary">应用 draft</button>
+          <button id="save-button" class="button button-quiet">保存配置</button>
+          <button id="reset-button" class="button button-quiet">恢复默认</button>
+          <button id="import-button" class="button button-quiet">导入 TOML</button>
+          <button id="export-button" class="button button-quiet">导出 TOML</button>
+          <input id="import-file" type="file" accept=".toml,text/plain" hidden>
+        </div>
+        <p id="config-message" class="message" role="status"></p>
+      </article>
+
+      <article class="panel profile-panel">
+        <div class="panel-heading">
+          <div>
+            <div class="card-label">PROFILES</div>
+            <h2>常用方案</h2>
+          </div>
+        </div>
+        <div class="profile-row">
+          <select id="profile-select" aria-label="Profile"></select>
+          <button id="load-profile-button" class="button button-primary">载入</button>
+        </div>
+        <div class="profile-row profile-save-row">
+          <input id="profile-name" maxlength="64" placeholder="profile 名称" aria-label="Profile 名称">
+          <button id="save-profile-button" class="button button-quiet">保存当前</button>
+        </div>
+        <div class="preset-row">
+          <button data-preset="pure" class="chip">纯录音</button>
+          <button data-preset="doa" class="chip">DOA</button>
+          <button data-preset="doa_bf" class="chip">DOA + BF</button>
+          <button data-preset="bf_fixed" class="chip">固定 BF</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel live-panel">
+      <div class="panel-heading">
+        <div>
+          <div class="card-label">LIVE SIGNAL</div>
+          <h2>方向与算法状态</h2>
+        </div>
+        <span id="pipeline-state" class="warning">Pipeline 未启用</span>
+      </div>
+      <div class="live-grid">
+        <div class="compass" aria-label="DOA compass">
+          <div class="compass-axis axis-x"></div><div class="compass-axis axis-y"></div>
+          <div id="doa-needle" class="doa-needle"></div><div class="compass-center"></div>
+          <span class="compass-mark compass-0">0°</span><span class="compass-mark compass-90">90°</span>
+          <span class="compass-mark compass-180">180°</span><span class="compass-mark compass-270">270°</span>
+        </div>
+        <div class="signal-metrics">
+          <div><span>Tracked</span><strong id="tracked-angle">--.-°</strong></div>
+          <div><span>Raw</span><strong id="raw-angle">--.-°</strong></div>
+          <div><span>Confidence</span><strong id="doa-confidence">--</strong></div>
+          <div><span>Status</span><strong id="doa-status">searching</strong></div>
+          <div><span>BF output</span><strong id="bf-frames">0 frames</strong></div>
+          <div><span>Clipped</span><strong id="bf-clipped">0</strong></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel archive-panel">
+      <div class="panel-heading">
+        <div>
+          <div class="card-label">ARCHIVE</div>
+          <h2>录音历史</h2>
+        </div>
+        <button id="refresh-button" class="button button-quiet">刷新</button>
+      </div>
+      <div id="recordings" class="recordings"><div class="empty-state">还没有录音记录。</div></div>
+    </section>
+
+    <section class="panel contract-panel" aria-labelledby="contract-title">
+      <div class="panel-heading">
+        <div>
+          <div class="card-label">FIXED CONTRACT</div>
+          <h2 id="contract-title">设备与输出说明</h2>
+        </div>
+        <span class="muted">v{{APP_VERSION}}</span>
+      </div>
+      <ul class="contract-list">
+        <li>固定使用 ReSpeaker WASAPI 独占模式、16 kHz、PCM16、6 通道；ch0 为固件算法输出，ch1..ch4 为原始 MIC，ch5 为 playback/AEC reference。</li>
+        <li>每次录音始终生成 algo、mic、ref 三路 WAV；启用 Pipeline 后可额外生成 DOA CSV 和 BF WAV。</li>
+        <li>4 通道 MIC WAV 可能无法被浏览器原生播放器正确播放，页面仍提供文件下载。</li>
+      </ul>
+    </section>
+
+    <section class="panel event-panel">
+      <div class="panel-heading">
+        <div>
+          <div class="card-label">LIVE EVENTS</div>
+          <h2>实时日志</h2>
+        </div>
+        <button id="clear-log-button" class="button button-quiet">清空</button>
+      </div>
+      <pre id="event-log" class="event-log" aria-live="polite"></pre>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

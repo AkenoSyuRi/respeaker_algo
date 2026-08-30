@@ -1,20 +1,19 @@
 # respeaker_algo
 
-ReSpeaker Mic Array v2.0（XMOS XVF-3000）Windows 专用录音与内置算法 Pipeline 工具。
+ReSpeaker Mic Array v2.0（XMOS XVF-3000）Windows 专用录音与内置算法 Pipeline 管理服务。
 
-程序固定使用 WASAPI 独占模式采集 **16 kHz / 16-bit / 6 通道**交织 PCM。默认只录音；
-传入 `--pipeline-config` 时，在独立 **algorithm worker** 中按配置串联运行内置 Rust 算法
-（当前支持实时 4-Mic 二维 DOA 与频域 Beamformer）。启用 DOA 且打开 Viewer 时会启动本地
-Web 页面。
+程序无参数启动，在 `http://127.0.0.1:8765` 提供本地 Web 管理界面。用户点击开始后，程序才
+使用 WASAPI 独占模式采集 **16 kHz / 16-bit / 6 通道**交织 PCM，并可在独立
+**algorithm worker** 中运行实时 4-Mic 二维 DOA 与频域 Beamformer。
 
 ## 线程模型
 
-运行时有三个角色：
+运行时有四个角色：
 
 ```text
-wasapi-capture          recorder loop           algorithm-worker（仅有 pipeline-config 时）
-  try_send CaptureBlock   写三路 raw WAV           256-frame hop → DOA → BF
-  有界 queue=128          try_send 到算法队列        CSV / Viewer / BF WAV
+main / Web Server         AudioController         recording session       algorithm-worker
+  REST + SSE               状态和 session owner     WASAPI + raw WAV         256-frame hop → DOA → BF
+  loopback only            有界控制通道             外部 stop / finalize       CSV / BF WAV
 ```
 
 过载语义：
@@ -45,34 +44,18 @@ wasapi-capture          recorder loop           algorithm-worker（仅有 pipeli
 ```powershell
 cargo build --release
 
-# 纯录音
-target\release\respeaker_algo.exe --duration 10 --out-dir target/out
-
-# 仅 DOA
-target\release\respeaker_algo.exe `
-  --duration 10 `
-  --out-dir target/out `
-  --pipeline-config configs/doa.toml
-
-# DOA + 鲁棒超指向 BF（15 dB 输出增益 + 输出 DRC，双声道对比）
-target\release\respeaker_algo.exe `
-  --duration 30 `
-  --out-dir target/out `
-  --pipeline-config configs/doa_bf.toml
-
-# 固定角 Delay-and-Sum BF（无 DOA，15 dB 输出增益 + 输出 DRC，双声道对比）
-target\release\respeaker_algo.exe `
-  --duration 30 `
-  --out-dir target/out `
-  --pipeline-config configs/bf_fixed.toml
+target\release\respeaker_algo.exe
 ```
 
-CLI 仅提供 `--duration`、`--out-dir`、`--prefix`、`--pipeline-config`。
+启动后在页面中选择纯录音、DOA、DOA + BF 或固定方向 BF preset，编辑 draft 并点击开始。
+配置保存在 `%LOCALAPPDATA%\respeaker_algo\config.toml`，录音输出目录和时长由页面配置。
+录音中的配置修改只对下一次 session 生效；Ctrl+C 会先停止录音并完成 WAV/manifest finalize。
 
 ## Pipeline 配置
 
 `[[modules]]` 按声明顺序执行。`direction_source = "doa"` 的 Beamformer 必须位于 enabled DOA
-之后。最多各启用一个 DOA 与一个 Beamformer。
+之后。最多各启用一个 DOA 与一个 Beamformer。现有 `configs/*.toml` 仍作为 preset/import 示例，
+正常操作不需要手写配置文件。
 
 示例：
 
@@ -121,8 +104,8 @@ STFT：512 / 256，periodic sqrt-Hann WOLA；约 32 ms 处理延迟（文件 sam
 sample 0）。`direction_source = doa` 时在 Searching / 无结果阶段使用
 `fallback_internal_angle_deg`。
 
-当前限制：单目标、二维远场、固定 4-Mic 几何、无在线 VAD/噪声协方差、raw WAV I/O 尚未
-线程解耦。
+当前限制：单目标、二维远场、固定 4-Mic 几何、无在线 VAD/噪声协方差；第一版不提供浏览器
+实时 PCM 监听、局域网访问或账户系统。
 
 ## Windows WASAPI 独占
 
@@ -134,13 +117,17 @@ sample 0）。`direction_source = doa` 时在 Searching / 无结果阶段使用
 ## 代码结构
 
 ```text
-src/main.rs              CLI
+src/main.rs              常驻 Web 服务入口
 src/audio.rs             CaptureBlock / 设备常量
+src/app_config.rs        AppConfig / profiles / presets
+src/controller.rs         状态机和 session ownership
+src/events.rs             EventBus / SSE envelope / snapshot
 src/recorder.rs          raw WAV + Pipeline 降级调度
 src/pipeline_worker.rs   algorithm worker / hop assembler
 src/pipeline.rs          TOML 与模块串联
 src/beamformer/          STFT、权重、MVDR、运行时
 src/doa/                 DOA
+src/recordings.rs        manifest / 历史文件 / trash
 src/wasapi.rs / wav.rs / web.rs
 configs/  docs/plans/  web/
 ```
