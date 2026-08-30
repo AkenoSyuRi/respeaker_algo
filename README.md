@@ -83,7 +83,7 @@ CLI 仅提供 `--duration`、`--out-dir`、`--prefix`、`--pipeline-config`。
 Beamformer 可省略字段的默认值：`algorithm = robust_superdirective`、
 `direction_source = doa`、`direction_smoothing_ms = 64`、`min_wng_db = 3`、
 频带 `350/500/2500/3500` Hz、`output_gain_db = -3`、`wav = true`、
-`compare_wav = false`、`enable_drc = false`。
+`compare_wav = false`、`enable_drc = true`。
 
 ## 角度坐标
 

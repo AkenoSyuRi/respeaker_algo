@@ -142,10 +142,10 @@ impl TssDrc {
 `BeamformerConfig` 与 TOML 只增加：
 
 ```toml
-enable_drc = true   # 默认 false
+enable_drc = true   # 默认 true
 ```
 
-默认 `false`，与「未配置则不启用算法能力」一致。`configs/doa_bf.toml` 与 `configs/bf_fixed.toml` 设为 `true`。
+默认 `true`。省略字段时启用输出 DRC；写 `enable_drc = false` 可关闭。
 
 ### 5.2 增益与 PCM
 
@@ -250,7 +250,7 @@ cargo build --release
 
 ## 8. 文档
 
-- `README.md`：BF WAV 说明改为「增益之后可接 DRC」；`compare_wav` 左右都是增益 + DRC；列出 `enable_drc` 默认 `false`。不要写成「与 TSS 管线电平一致」。
+- `README.md`：BF WAV 说明改为「增益之后可接 DRC」；`compare_wav` 左右都是增益 + DRC；列出 `enable_drc` 默认 `true`。不要写成「与 TSS 管线电平一致」。
 - `AGENTS.md`：补充 BF 输出路径为增益 → 可选 DRC → PCM16。
 - 配置示例打开 `enable_drc = true`。
 - `tools/generate_drc_golden.py` 只用于再生 golden，不写入 README 主流程。

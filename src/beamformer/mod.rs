@@ -67,7 +67,7 @@ impl Default for BeamformerConfig {
             output_gain_db: -3.0,
             wav: true,
             compare_wav: false,
-            enable_drc: false,
+            enable_drc: true,
         }
     }
 }

@@ -94,6 +94,10 @@ fn default_compare_wav() -> bool {
     false
 }
 
+fn default_enable_drc() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
@@ -156,7 +160,7 @@ enum ModuleConfig {
         wav: bool,
         #[serde(default = "default_compare_wav")]
         compare_wav: bool,
-        #[serde(default)]
+        #[serde(default = "default_enable_drc")]
         enable_drc: bool,
     },
 }
@@ -588,7 +592,7 @@ direction_source = "fixed"
         assert_eq!(*compare_wav, d.compare_wav);
         assert!(!d.compare_wav);
         assert_eq!(*enable_drc, d.enable_drc);
-        assert!(!d.enable_drc);
+        assert!(d.enable_drc);
     }
 
     #[test]
