@@ -37,7 +37,7 @@
             <label class="choice"><input id="duration-custom" name="duration-mode" type="radio" value="custom"><span>自定义</span></label>
             <label id="duration-value-wrap" class="duration-value" hidden><input id="duration-seconds" class="text-input" type="number" min="1" step="1"><span>秒</span></label>
           </div></fieldset>
-          <details class="more-settings"><summary>更多录音设置</summary><label class="field-label" for="recording-prefix">文件名前缀 <small>留空时自动生成</small></label><input id="recording-prefix" class="text-input" type="text" maxlength="64" spellcheck="false"></details>
+          <details class="more-settings"><summary>更多录音设置</summary><label class="field-label" for="recording-prefix">文件名前缀 <small>留空时自动生成</small></label><input id="recording-prefix" class="text-input" type="text" maxlength="128" spellcheck="false"></details>
           <div class="recording-action"><div id="recording-state" class="recording-state"><i class="phase-indicator"></i><span id="phase-label">等待开始录音</span><strong id="elapsed-time">00:00</strong></div>
             <div class="button-row"><button id="start-button" class="button button-primary" disabled>开始录音</button><button id="stop-button" class="button button-stop" disabled>停止录音</button></div>
             <p id="session-note" class="session-note" hidden>当前录音使用启动时的配置。本页修改将在下一次录音时生效。</p><p id="config-message" class="feedback" role="status" aria-live="polite"></p>
@@ -47,7 +47,7 @@
           <div class="section-heading compact-heading"><div><h2>实时结果</h2><p id="live-subtitle">设备与录音状态会在这里更新。</p></div><button id="details-open-button" class="text-button" data-dialog="details-dialog">详细信息</button></div>
           <div id="live-pure" class="live-mode" hidden><div class="live-empty"><b>原始录音</b><span id="live-save-location">保存至 recordings/</span></div></div>
           <div id="live-doa" class="live-mode" hidden><div class="compass-layout"><div id="doa-compass" class="compass" role="img" aria-label="声源方向罗盘"><span class="compass-mark mark-0">0°</span><span class="compass-mark mark-90">90°</span><span class="compass-mark mark-180">180°</span><span class="compass-mark mark-270">270°</span><i id="doa-needle" class="compass-needle"></i><i class="compass-center"></i></div><div class="live-summary"><strong id="doa-angle">--°</strong><span id="doa-status" class="live-status">正在搜索声源</span><span id="doa-mode-status" class="muted-status"></span></div></div></div>
-          <div id="live-fixed" class="live-mode" hidden><div class="compass-layout"><div id="fixed-compass" class="compass" role="img" aria-label="固定拾音方向罗盘"><span class="compass-mark mark-0">0°</span><span class="compass-mark mark-90">90°</span><span class="compass-mark mark-180">180°</span><span class="compass-mark mark-270">270°</span><i id="fixed-needle" class="compass-needle"></i><i class="compass-center"></i></div><div class="live-summary"><span class="muted-status">当前拾音方向</span><strong id="fixed-angle">0°</strong><span class="live-status">固定方向</span></div></div></div>
+          <div id="live-fixed" class="live-mode" hidden><div class="compass-layout"><div id="fixed-compass" class="compass compass-internal" role="img" aria-label="固定拾音方向罗盘，内部角度"><span class="compass-mark internal-mark-90">90°</span><span class="compass-mark internal-mark-0">0°</span><span class="compass-mark internal-mark-180">180°</span><span class="compass-mark internal-mark-270">270°</span><i id="fixed-needle" class="compass-needle"></i><i class="compass-center"></i></div><div class="live-summary"><span class="muted-status">当前拾音方向</span><strong id="fixed-angle">0°</strong><span class="live-status">固定方向</span></div></div></div>
           <div id="algorithm-status" class="algorithm-status" hidden></div><p id="live-hint" class="live-hint">开始录音后显示实时方向与算法状态。</p><p id="clipping-warning" class="clipping-warning" hidden>检测到 Beamformer 输出削波</p>
         </section>
       </div>
@@ -69,7 +69,7 @@
               <label class="field-label">目标捕获阈值 <small>acquire_confidence</small><input id="doa-acquire-confidence" class="text-input" type="number" min="0" max="1" step="0.01"></label>
               <label class="field-label">目标更新阈值 <small>update_confidence</small><input id="doa-update-confidence" class="text-input" type="number" min="0" max="1" step="0.01"></label>
               <label class="field-label">丢失保持时间 <small>max_coast_ms</small><div class="unit-field"><input id="doa-max-coast" class="text-input" type="number" min="1" step="1"><span>ms</span></div></label>
-            </div><div class="toggle-list"><label><input id="doa-enable-viewer" type="checkbox"> 启用方向查看器 <small>enable_viewer</small></label><label><input id="doa-csv" type="checkbox"> 保存 DOA CSV <small>csv</small></label></div></details>
+            </div><div class="toggle-list"><label><input id="doa-csv" type="checkbox"> 保存 DOA CSV <small>csv</small></label></div></details>
           </div>
         </article>
         <article class="surface module-card">
@@ -85,14 +85,14 @@
             </div>
             <details class="expert-section"><summary>专家参数</summary><div class="field-grid">
               <label class="field-label">算法 <small>algorithm</small><select id="bf-algorithm" class="text-input"><option value="robust_superdirective">鲁棒超指向 Beamformer</option><option value="delay_sum">Delay-and-Sum</option></select></label>
-              <label class="field-label">方向平滑 <small>direction_smoothing_ms</small><div class="unit-field"><input id="bf-smoothing" class="text-input" type="number" min="0" step="1"><span>ms</span></div></label>
-              <label class="field-label">最小白噪声增益 <small>min_wng_db</small><div class="unit-field"><input id="bf-min-wng" class="text-input" type="number" min="0" max="6" step="0.1"><span>dB</span></div></label>
-            </div><div class="frequency-section"><h3>超指向频带</h3><div class="field-grid">
+              <label id="bf-smoothing-setting" class="field-label">方向平滑 <small>direction_smoothing_ms</small><div class="unit-field"><input id="bf-smoothing" class="text-input" type="number" min="0" step="1"><span>ms</span></div></label>
+              <label id="bf-min-wng-setting" class="field-label">最小白噪声增益 <small>min_wng_db</small><div class="unit-field"><input id="bf-min-wng" class="text-input" type="number" min="0" max="6" step="0.1"><span>dB</span></div></label>
+            </div><div id="bf-frequency-setting" class="frequency-section"><h3>超指向频带</h3><div class="field-grid">
               <label class="field-label">低频起点 <small>sd_low_start_hz</small><div class="unit-field"><input id="bf-sd-low-start" class="text-input" type="number" min="0" max="8000" step="10"><span>Hz</span></div></label>
               <label class="field-label">低频完整处理 <small>sd_low_full_hz</small><div class="unit-field"><input id="bf-sd-low-full" class="text-input" type="number" min="0" max="8000" step="10"><span>Hz</span></div></label>
               <label class="field-label">高频完整处理 <small>sd_high_full_hz</small><div class="unit-field"><input id="bf-sd-high-full" class="text-input" type="number" min="0" max="8000" step="10"><span>Hz</span></div></label>
               <label class="field-label">高频终点 <small>sd_high_end_hz</small><div class="unit-field"><input id="bf-sd-high-end" class="text-input" type="number" min="0" max="8000" step="10"><span>Hz</span></div></label>
-            </div></div><div class="toggle-list"><label><input id="bf-wav" type="checkbox"> 输出 Beamformer WAV <small>wav</small></label><label><input id="bf-compare-wav" type="checkbox"> 输出对比 WAV <small>compare_wav</small></label></div></details>
+            </div></div><div class="toggle-list"><label><input id="bf-wav" type="checkbox"> 输出 Beamformer WAV <small>wav</small></label><label id="bf-compare-wav-setting"><input id="bf-compare-wav" type="checkbox"> 输出对比 WAV <small>compare_wav</small></label></div></details>
           </div>
         </article>
       </div>
@@ -114,7 +114,7 @@
           <div class="config-actions"><button id="save-settings-button" class="button button-primary">保存设置</button><button id="import-button" class="button button-secondary">导入 TOML</button><button id="export-button" class="button button-secondary">导出 TOML</button><button id="reset-button" class="button button-quiet">恢复默认</button><input id="import-file" type="file" accept=".toml,text/plain" hidden></div><p id="advanced-message" class="feedback" role="status"></p>
         </section>
         <section class="surface advanced-section developer-tools"><div class="section-heading compact-heading"><div><h2>开发者工具</h2><p>用于诊断问题，复制内容不包含完整配置或音频。</p></div></div>
-          <details class="raw-config"><summary>查看原始 AppConfig</summary><textarea id="config-editor" class="code-editor" spellcheck="false" aria-label="AppConfig JSON"></textarea><div class="toolbar"><button id="apply-json-button" class="button button-secondary">应用原始配置</button></div></details>
+          <details id="raw-config-details" class="raw-config"><summary>查看原始 AppConfig</summary><textarea id="config-editor" class="code-editor" spellcheck="false" aria-label="AppConfig JSON"></textarea><div class="toolbar"><button id="apply-json-button" class="button button-secondary">应用原始配置</button></div></details>
           <div class="event-panel"><div class="event-heading"><h3>实时事件日志</h3><button id="clear-log-button" class="text-button">清空</button></div><pre id="event-log" class="event-log" aria-live="polite"></pre></div>
           <div class="diagnostic-action"><button id="copy-diagnostics-button" class="button button-primary">复制诊断信息</button><p>包含服务、设备和错误状态，不包含音频数据或完整 AppConfig。</p></div>
         </section>

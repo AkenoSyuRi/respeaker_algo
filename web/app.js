@@ -8,6 +8,7 @@
     latestDoa: null,
     latestBf: null,
     dirty: false,
+    rawEditorDirty: false,
     source: null,
     log: [],
     reconnectTimer: null,
@@ -100,6 +101,7 @@
     const bf = getModule(config, "beamformer") || {};
 
     $("config-editor").value = JSON.stringify(config, null, 2);
+    state.rawEditorDirty = false;
     $("out-dir").value = recording.out_dir ?? "recordings";
     $("recording-prefix").value = recording.prefix ?? "";
     const duration = Number(recording.duration_seconds || 0);
@@ -114,7 +116,6 @@
     $("doa-acquire-confidence").value = doa.acquire_confidence ?? 0.55;
     $("doa-update-confidence").value = doa.update_confidence ?? 0.35;
     $("doa-max-coast").value = doa.max_coast_ms ?? 500;
-    $("doa-enable-viewer").checked = doa.enable_viewer !== false;
     $("doa-csv").checked = Boolean(doa.csv);
 
     setRadio("bf-direction-source", bf.direction_source ?? "doa");
@@ -160,6 +161,11 @@
     const direction = selectedRadio("bf-direction-source", getModule(state.config, "beamformer")?.direction_source || "doa");
     $("bf-fallback-setting").hidden = !bfEnabled || direction !== "doa";
     $("bf-fixed-setting").hidden = !bfEnabled || direction !== "fixed";
+    const delaySum = $("bf-algorithm").value === "delay_sum";
+    $("bf-smoothing-setting").hidden = !bfEnabled || direction === "fixed";
+    $("bf-min-wng-setting").hidden = !bfEnabled || delaySum;
+    $("bf-frequency-setting").hidden = !bfEnabled || delaySum;
+    $("bf-compare-wav-setting").hidden = !$("bf-wav").checked;
     renderLivePanel();
   }
 
@@ -194,7 +200,6 @@
         acquire_confidence: numberFrom("doa-acquire-confidence"),
         update_confidence: numberFrom("doa-update-confidence"),
         max_coast_ms: Math.max(1, Math.round(numberFrom("doa-max-coast"))),
-        enable_viewer: $("doa-enable-viewer").checked,
         csv: $("doa-csv").checked,
       });
     }
@@ -280,10 +285,23 @@
   function renderSnapshot(snapshot) {
     snapshot = snapshot?.payload || snapshot;
     if (!snapshot) return;
+    const previousPhase = phaseInfo(state.snapshot).name;
     state.snapshot = Object.assign({}, state.snapshot || {}, snapshot);
     const current = state.snapshot;
     const phase = phaseInfo(current);
     const phaseName = phase.name;
+    if (phaseName === "starting" && previousPhase !== "starting") {
+      state.latestDoa = null;
+      state.latestBf = null;
+      current.recording = Object.assign({}, current.recording || {}, { captured_frames: 0, elapsed_secs: 0 });
+      if (current.pipeline) {
+        current.pipeline = Object.assign({}, current.pipeline);
+        delete current.pipeline.bf_stats;
+      }
+      $("doa-angle").textContent = "--°";
+      $("doa-status").textContent = "算法正在启动…";
+      $("doa-needle").style.transform = "translate(-50%,-100%) rotate(180deg)";
+    }
     const phaseLabels = { idle: "等待开始录音", starting: "正在启动…", recording: "录音中", stopping: "正在停止并保存文件…" };
     $("phase-label").textContent = phaseLabels[phaseName] || phaseName;
     $("recording-state").classList.toggle("active", phaseName === "recording");
@@ -309,7 +327,9 @@
     const error = snapshot?.last_error;
     const pipeline = snapshot?.pipeline;
     const source = String(error?.source || "").toLowerCase();
-    const clipped = Number(pipeline?.bf_stats?.clipped_samples || state.latestBf?.clipped_samples || 0);
+    const clipped = phaseInfo(snapshot).name === "recording"
+      ? Number(pipeline?.bf_stats?.clipped_samples || state.latestBf?.clipped_samples || 0)
+      : 0;
     if (device && !device.available) {
       text = "未检测到 ReSpeaker。" + (device.error ? " " + device.error : "");
     } else if (error && source !== "pipeline") {
@@ -355,6 +375,7 @@
     if (state.snapshot?.pipeline) state.snapshot.pipeline.bf_stats = data;
     renderStatusBanner();
     renderDetailedInfo();
+    renderLivePanel();
   }
 
   function renderLivePanel() {
@@ -375,17 +396,26 @@
     $("live-save-location").textContent = "保存至 " + ($("out-dir").value.trim() || "recordings");
     $("live-subtitle").textContent = showPure ? "当前模式保留原始多通道音频。" : showFixed ? "固定方向以 Beamformer 内部角度显示。" : "实时显示声源方向与算法状态。";
     if (showFixed) {
-      const angle = Number(bf?.fixed_internal_angle_deg || 0);
+      const inputAngle = Number($("bf-fixed-angle").value);
+      const angle = Number.isFinite(inputAngle) ? ((inputAngle % 360) + 360) % 360 : Number(bf?.fixed_internal_angle_deg || 0);
       $("fixed-angle").textContent = angle.toFixed(0) + "°";
       $("fixed-needle").style.transform = "translate(-50%,-100%) rotate(" + (90 - angle) + "deg)";
     }
     const pipeline = state.snapshot?.pipeline || {};
+    const phase = phaseInfo(state.snapshot).name;
+    const recording = phase === "recording";
     const status = $("algorithm-status");
     status.hidden = !bfEnabled;
-    status.classList.toggle("degraded", Boolean(pipeline.degraded));
-    status.textContent = pipeline.degraded ? "算法处理已降级：" + (pipeline.error || "请查看详细信息。") : (direction === "fixed" ? "定向拾音正常" : "自动拾音正常");
-    const stats = pipeline.bf_stats || state.latestBf || {};
-    $("clipping-warning").hidden = Number(stats.clipped_samples || 0) === 0;
+    status.classList.toggle("degraded", recording && Boolean(pipeline.degraded));
+    if (!recording) {
+      status.textContent = ({ idle: "录音开始后启用", starting: "算法正在启动…", stopping: "正在停止…" })[phase] || "录音开始后启用";
+    } else {
+      status.textContent = pipeline.degraded
+        ? "算法处理已降级：" + (pipeline.error || "请查看详细信息。")
+        : direction === "fixed" ? "定向拾音正常" : "自动拾音正常";
+    }
+    const stats = recording ? (pipeline.bf_stats || state.latestBf || {}) : {};
+    $("clipping-warning").hidden = !recording || Number(stats.clipped_samples || 0) === 0;
   }
 
   function renderDetailedInfo() {
@@ -586,6 +616,13 @@
     try { await commitConfig(true); } catch (error) { setFeedback(error.message, true); }
   }
 
+  async function exportConfig() {
+    try {
+      await commitConfig(false);
+      window.location.href = "/api/config/export";
+    } catch (error) { setFeedback(error.message, true); }
+  }
+
   async function startRecording() {
     $("start-button").disabled = true;
     try {
@@ -727,7 +764,7 @@
       $("panel-" + tab.dataset.tab).hidden = !selected;
       if (selected && focus) tab.focus();
     }
-    if (name === "recordings" && !state.recordings.length) loadRecordings().catch((error) => setFeedback(error.message, true));
+    if (name === "recordings") loadRecordings().catch((error) => setFeedback(error.message, true));
   }
 
   function openDialog(id) {
@@ -762,7 +799,7 @@
       });
       $(id).addEventListener("change", () => { setDirty(true); updateConditionalUi(); });
     }
-    for (const selector of ['input[name="duration-mode"]', 'input[name="doa-clockwise"]', 'input[name="bf-direction-source"]', "#doa-enable-viewer", "#doa-csv", "#bf-enable-drc", "#bf-wav", "#bf-compare-wav"]) {
+    for (const selector of ['input[name="duration-mode"]', 'input[name="doa-clockwise"]', 'input[name="bf-direction-source"]', "#doa-csv", "#bf-enable-drc", "#bf-wav", "#bf-compare-wav"]) {
       for (const input of document.querySelectorAll(selector)) {
         input.addEventListener("change", () => { setDirty(true); updateConditionalUi(); });
       }
@@ -798,11 +835,16 @@
     $("profile-select").addEventListener("change", () => { $("delete-profile-button").disabled = !$("profile-select").value; });
     $("import-button").addEventListener("click", () => $("import-file").click());
     $("import-file").addEventListener("change", importConfig);
-    $("export-button").addEventListener("click", () => { window.location.href = "/api/config/export"; });
+    $("export-button").addEventListener("click", exportConfig);
     $("reset-button").addEventListener("click", () => openDialog("reset-dialog"));
     $("cancel-reset-button").addEventListener("click", () => $("reset-dialog").close());
     $("confirm-reset-button").addEventListener("click", resetConfig);
     $("apply-json-button").addEventListener("click", applyRawConfig);
+    $("raw-config-details").addEventListener("toggle", () => {
+      if (!$("raw-config-details").open || state.rawEditorDirty || !state.config) return;
+      $("config-editor").value = JSON.stringify(collectConfigFromUi(), null, 2);
+    });
+    $("config-editor").addEventListener("input", () => { state.rawEditorDirty = true; });
     $("clear-log-button").addEventListener("click", () => { state.log = []; $("event-log").textContent = ""; });
     $("copy-diagnostics-button").addEventListener("click", copyDiagnostics);
     $("device-info-button").addEventListener("click", () => openDialog("device-dialog"));
