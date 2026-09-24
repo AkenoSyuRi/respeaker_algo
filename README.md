@@ -47,7 +47,7 @@ cargo build --release
 target\release\respeaker_algo.exe
 ```
 
-启动后在页面中选择纯录音、DOA、DOA + BF 或固定方向 BF preset，编辑 draft 并点击开始。
+启动后可在“运行”页选择原始录音、声源定位、自动拾音或定向拾音，编辑录音设置后直接开始。开始时页面会先同步当前设置；录音中修改的内容将在下一次录音时生效。需要保留设置时，使用“保存设置”写入配置文件。
 配置保存在 `%LOCALAPPDATA%\respeaker_algo\config.toml`，录音输出目录和时长由页面配置。
 录音中的配置修改只对下一次 session 生效；Ctrl+C 会先停止录音并完成 WAV/manifest finalize。
 
